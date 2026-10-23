@@ -6093,1084 +6093,6 @@ local function main()
 		return {new = new}
 	end)()
 
-	---------------------------------------------------------------------------------------------------
-	-- Lib.Skin  -  Skidnet window engine inside Dex
-	--
-	-- Port of the Skidnet script: every floating Dex window gets
-	--   * a background rasterised into a 2x EditableImage (anti-aliased rounded rect + glass rim)
-	--     drawn on an EditableMesh sheet inside a ViewportFrame behind the window,
-	--   * KWin "wobbly windows" physics (spring grid, grab constraint, edge collisions),
-	--   * a Liquid Glass MeshPart in front of the camera that follows the same deformation,
-	--   * macOS traffic-light buttons (close / minimise / centre) and a Roboto title,
-	-- and RightCtrl collapses everything into the Skidnet watermark pill (nick / FPS / ping).
-	--
-	-- The window CONTENT (Explorer tree, Properties, editor, ...) is made of live Instances, so it
-	-- cannot be baked into the texture like Skidnet's own rows: it rides rigidly on the centre of the
-	-- jelly while the glass behind it deforms. Without EditableMesh/EditableImage support (or when
-	-- Skin.Enabled = false) windows keep the same look as plain rounded glass frames (no wobble).
-	--
-	-- Search for [SKIN:...] markers to find the tunable parts.
-	---------------------------------------------------------------------------------------------------
-	Lib.Skin = (function()
-		local Skin = {Enabled = true, Hidden = false, Supported = nil, UseGlass = true}
-		local floor, ceil, clamp, sqrt, abs, max, min, exp, sin =
-			math.floor, math.ceil, math.clamp, math.sqrt, math.abs, math.max, math.min, math.exp, math.sin
-		local UIS = game:GetService("UserInputService")
-		local RunService = game:GetService("RunService")
-		local GuiService = game:GetService("GuiService")
-		local AssetService = game:GetService("AssetService")
-		local TweenService = game:GetService("TweenService")
-		local Players = game:GetService("Players")
-		local fromOffset = UDim2.fromOffset
-
-		-- [SKIN:CONFIG] physics + look (values taken from Skidnet's WobblyWindows4 preset)
-		local CFG = {
-			stiffness = 240, damping = 1.8, grab = 2000, grid = {10, 8},
-			collide = true, restitution = 0, jellyClick = true,
-			radius = 16, bgAlpha = 0.22, rim = 0.80,
-			glassTransp = 0.55, refract = 0.70, reflect = 0.15, tint = {255, 255, 255},
-		}
-		Skin.CFG = CFG
-		-- [SKIN:COLORS] Liquid Glass (dark)
-		local ST = {
-			bg = {10, 12, 16}, text = {255, 255, 255}, dim = {222, 228, 236},
-			accent = {61, 174, 233}, close = {255, 95, 87}, min = {254, 188, 46}, center = {40, 200, 64},
-		}
-		Skin.ST = ST
-		local SS = 2                 -- texture supersampling
-		local MG = 4                 -- transparent margin around the window (anti-aliased edge)
-		local RX, RY = 36, 24        -- window mesh resolution
-		local GRX, GRY = 28, 20      -- glass mesh resolution
-		local MAX_H = 1 / 360
-		local DG = 1
-		local PX, PY = CFG.grid[1], CFG.grid[2]
-		local NN = PX * PY
-		local BAR_H = 20             -- Dex title bar height
-		local FONT_MED
-		pcall(function() FONT_MED = Font.new("rbxasset://fonts/families/Roboto.json", Enum.FontWeight.Medium) end)
-
-		local hasBuffer = type(buffer) == "table" and buffer.create ~= nil
-		local rd8, wr8, wr32, bcopy
-		if hasBuffer then rd8, wr8, wr32, bcopy = buffer.readu8, buffer.writeu8, buffer.writeu32, buffer.copy end
-
-		local rigs = {}          -- window -> rig
-		local rigList = {}
-		local useAlpha = false
-		local cam
-		local V = {x = 0, y = 0, insetY = 0, fov = 0, tanH = 1}
-		local lastTouch
-		local conns = {}
-
-		---------------------------------------------------------------- capability check
-		local function trySA()
-			local sa = Instance.new("SurfaceAppearance")
-			local ok = pcall(function() sa.AlphaMode = Enum.AlphaMode.Transparency end)
-			if not ok and typeof(sethiddenproperty) == "function" then
-				ok = pcall(sethiddenproperty, sa, "AlphaMode", Enum.AlphaMode.Transparency)
-			end
-			if ok and sa.AlphaMode == Enum.AlphaMode.Transparency then return sa end
-			sa:Destroy()
-			return nil
-		end
-
-		local function checkSupport()
-			if Skin.Supported ~= nil then return Skin.Supported end
-			Skin.Supported = false
-			if not hasBuffer then return false end
-			local ok = pcall(function()
-				local img = AssetService:CreateEditableImage({Size = Vector2.new(4, 4)})
-				img:Destroy()
-				local em = AssetService:CreateEditableMesh()
-				em:Destroy()
-				assert(Content and Content.fromObject)
-			end)
-			if not ok then return false end
-			local t = trySA()
-			if t then useAlpha = true t:Destroy() end
-			if not useAlpha then CFG.radius = 0 end -- no per-pixel alpha: square corners, like Skidnet
-			Skin.Supported = true
-			return true
-		end
-
-		---------------------------------------------------------------- helpers
-		local function smooth(e0, e1, x)
-			local t = clamp((x - e0) / (e1 - e0), 0, 1)
-			return t * t * (3 - 2 * t)
-		end
-		local function sdRound(px, py, x, y, w, h, r)
-			local qx = abs(px - (x + w * 0.5)) - (w * 0.5 - r)
-			local qy = abs(py - (y + h * 0.5)) - (h * 0.5 - r)
-			local ox, oy = max(qx, 0), max(qy, 0)
-			return sqrt(ox * ox + oy * oy) + min(max(qx, qy), 0) - r
-		end
-		local function C3(c) return Color3.fromRGB(c[1], c[2], c[3]) end
-
-		---------------------------------------------------------------- rasteriser
-		local function fillSpan32(R, o, n, val)
-			if n <= 0 then return end
-			wr32(R.canvas, o, val)
-			local done = 1
-			while done < n do
-				local c = min(done, n - done)
-				bcopy(R.canvas, o + done * 4, R.canvas, o, c * 4)
-				done = done + c
-			end
-		end
-
-		-- [SKIN:BACKGROUND] the window texture: translucent dark body + white glass rim, transparent outside
-		local function drawBackground(R)
-			local TXW, TXH, WW, WH = R.TXW, R.TXH, R.WW, R.WH
-			local canvas = R.canvas
-			local rad = CFG.radius * SS
-			local rim = useAlpha and CFG.rim or 0
-			local bga = useAlpha and CFG.bgAlpha or 1
-			local bg = ST.bg
-			local x0, y0, w, h = MG * SS, MG * SS, WW * SS, WH * SS
-			local band = floor((max(CFG.radius, 16) + MG) * SS + 2)
-			if band * 2 > TXW then band = floor(TXW / 2) end
-			for py = 0, TXH - 1 do
-				if py % 24 == 23 then task.wait() end -- the texture is big: do not freeze the game while painting it
-				local fy = py + 0.5
-				local yn = clamp((py - y0) / h, 0, 1)
-				local sheen = (1 - yn) ^ 3 * 0.10 * rim
-				local r, g, b, a = bg[1], bg[2], bg[3], bga
-				if sheen > 0 then
-					local na = a + sheen * (1 - a)
-					r = (r * a * (1 - sheen) + 255 * sheen) / na
-					g = (g * a * (1 - sheen) + 255 * sheen) / na
-					b = (b * a * (1 - sheen) + 255 * sheen) / na
-					a = na
-				end
-				local inner = floor(r + 0.5) + floor(g + 0.5) * 256 + floor(b + 0.5) * 65536 + floor(a * 255 + 0.5) * 16777216
-				local rowO = py * TXW * 4
-				local edgeRow = py < band or py >= TXH - band
-				local function edgePx(pxx)
-					local o = rowO + pxx * 4
-					local d = sdRound(pxx + 0.5, fy, x0, y0, w, h, rad)
-					local cov = 0.5 - d
-					if cov <= 0 then wr32(canvas, o, 0) return end
-					if cov > 1 then cov = 1 end
-					local R_, G_, B_, A_ = r, g, b, a
-					local e = -d / SS
-					local nx, ny = (pxx - x0) / w * 2 - 1, yn * 2 - 1
-					local dir = 0.3 + 0.7 * abs((-nx - ny) * 0.5)
-					local line = clamp(1 - e / 1.6, 0, 1)
-					local glow = 1 - clamp(e / 14, 0, 1)
-					local wa = clamp(rim * (line * 0.95 * dir + glow * glow * 0.20 * dir), 0, 1)
-					if wa > 0 then
-						local na = A_ + wa * (1 - A_)
-						R_ = (R_ * A_ * (1 - wa) + 255 * wa) / na
-						G_ = (G_ * A_ * (1 - wa) + 255 * wa) / na
-						B_ = (B_ * A_ * (1 - wa) + 255 * wa) / na
-						A_ = na
-					end
-					wr32(canvas, o, floor(R_ + 0.5) + floor(G_ + 0.5) * 256 + floor(B_ + 0.5) * 65536 + floor(A_ * cov * 255 + 0.5) * 16777216)
-				end
-				if edgeRow then
-					for pxx = 0, TXW - 1 do edgePx(pxx) end
-				else
-					for pxx = 0, band - 1 do edgePx(pxx) end
-					fillSpan32(R, rowO + band * 4, TXW - 2 * band, inner)
-					for pxx = TXW - band, TXW - 1 do edgePx(pxx) end
-				end
-			end
-		end
-
-		---------------------------------------------------------------- meshes
-		local function anchors(em)
-			local L, uv0 = 8, em:AddUV(Vector2.new(0, 0))
-			local function tri(p1, p2, p3)
-				local f = em:AddTriangle(em:AddVertex(p1), em:AddVertex(p2), em:AddVertex(p3))
-				em:SetFaceUVs(f, {uv0, uv0, uv0})
-			end
-			tri(Vector3.new(-L, -L, L), Vector3.new(L, -L, L), Vector3.new(L, L, L))
-			tri(Vector3.new(0, 0, -L), Vector3.new(1e-4, 0, -L), Vector3.new(0, 1e-4, -L))
-		end
-
-		-- topology only; rest coordinates (us / vs) are filled by layoutSheet for the current window size
-		local function newSheet(nx, ny, glass)
-			local em = AssetService:CreateEditableMesh()
-			local n1 = nx + 1
-			local vids, uvs, nF, nB, ss, tt = {}, {}, {}, {}, {}, {}
-			for j = 0, ny do
-				for i = 0, nx do
-					local k = j * n1 + i + 1
-					local s, t = i / nx, j / ny
-					if glass then
-						s = s - 0.8 * sin(2 * math.pi * s) / (2 * math.pi)
-						t = t - 0.8 * sin(2 * math.pi * t) / (2 * math.pi)
-					end
-					ss[k], tt[k] = s, t
-					vids[k] = em:AddVertex(Vector3.new(0, 0, -1))
-					uvs[k] = em:AddUV(Vector2.new(i / nx, j / ny))
-					if glass then
-						nF[k] = em:AddNormal(Vector3.new(0, 0, 1))
-						nB[k] = em:AddNormal(Vector3.new(0, 0, -1))
-					end
-				end
-			end
-			local function tri(a, b, c, nt)
-				local f = em:AddTriangle(vids[a], vids[b], vids[c])
-				em:SetFaceUVs(f, {uvs[a], uvs[b], uvs[c]})
-				if nt then em:SetFaceNormals(f, {nt[a], nt[b], nt[c]}) end
-			end
-			for j = 0, ny - 1 do
-				for i = 0, nx - 1 do
-					local a = j * n1 + i + 1
-					local b, c = a + 1, a + n1
-					local d = c + 1
-					tri(a, c, b, glass and nF); tri(b, c, d, glass and nF)
-					tri(a, b, c, glass and nB); tri(b, d, c, glass and nB)
-				end
-			end
-			anchors(em)
-			return {em = em, vids = vids, nF = nF, nB = nB, ss = ss, tt = tt, us = {}, vs = {}, n = n1 * (ny + 1), glass = glass}
-		end
-
-		local function layoutSheet(sheet, WW, WH)
-			for k = 1, sheet.n do
-				if sheet.glass then
-					sheet.us[k], sheet.vs[k] = sheet.ss[k] * WW, sheet.tt[k] * WH
-				else
-					sheet.us[k], sheet.vs[k] = -MG + sheet.ss[k] * (WW + 2 * MG), -MG + sheet.tt[k] * (WH + 2 * MG)
-				end
-			end
-		end
-
-		local function sheetPart(sheet)
-			local mp = AssetService:CreateMeshPartAsync(Content.fromObject(sheet.em), {CollisionFidelity = Enum.CollisionFidelity.Box})
-			mp.Anchored = true
-			mp.CanCollide = false
-			pcall(function() mp.CanQuery = false; mp.CanTouch = false end)
-			mp.CastShadow = false
-			pcall(function() mp.Size = mp.MeshSize end)
-			mp.CFrame = CFrame.new()
-			return mp
-		end
-
-		---------------------------------------------------------------- spring grid physics (KWin style)
-		-- Catmull-Rom weights from the PX x PY node grid to any mesh vertex
-		local function cr1D(f, np)
-			local i = clamp(floor(f), 0, np - 2)
-			local t = f - i
-			local t2, t3 = t * t, t * t * t
-			local w = {(-t3 + 2 * t2 - t) / 2, (3 * t3 - 5 * t2 + 2) / 2, (-3 * t3 + 4 * t2 + t) / 2, (t3 - t2) / 2}
-			local acc = {}
-			for q = 0, 3 do
-				local id, ww = i - 1 + q, w[q + 1]
-				if id < 0 then acc[0] = (acc[0] or 0) + 2 * ww; acc[1] = (acc[1] or 0) - ww
-				elseif id > np - 1 then acc[np - 1] = (acc[np - 1] or 0) + 2 * ww; acc[np - 2] = (acc[np - 2] or 0) - ww
-				else acc[id] = (acc[id] or 0) + ww end
-			end
-			local out = {}
-			for id, ww in pairs(acc) do table.insert(out, {id, ww}) end
-			return out
-		end
-
-		local function buildWeights(WW, WH, us, vs, n)
-			local WI, WV = table.create(n * 16, 1), table.create(n * 16, 0)
-			for k = 1, n do
-				local xs = cr1D(us[k] / WW * (PX - 1), PX)
-				local ys = cr1D(vs[k] / WH * (PY - 1), PY)
-				local o, s = (k - 1) * 16, 0
-				for _, xa in ipairs(xs) do
-					for _, ya in ipairs(ys) do
-						s = s + 1
-						WI[o + s] = ya[1] * PX + xa[1] + 1
-						WV[o + s] = xa[2] * ya[2]
-					end
-				end
-			end
-			return {WI, WV, n}
-		end
-
-		local function evalList(R, wt, outX, outY)
-			local WI, WV, n = wt[1], wt[2], wt[3]
-			local px, py = R.px, R.py
-			for k = 1, n do
-				local o, x, y = (k - 1) * 16, 0, 0
-				for s = 1, 16 do
-					local w = WV[o + s]
-					if w ~= 0 then
-						local id = WI[o + s]
-						x = x + w * px[id]; y = y + w * py[id]
-					end
-				end
-				outX[k], outY[k] = x, y
-			end
-		end
-
-		local function initNodes(R)
-			local WW, WH = R.WW, R.WH
-			R.rx, R.ry, R.px, R.py, R.vx, R.vy, R.ax, R.ay = {}, {}, {}, {}, {}, {}, {}, {}
-			R.edges = {}
-			for j = 0, PY - 1 do
-				for i = 0, PX - 1 do
-					local n = j * PX + i + 1
-					R.rx[n], R.ry[n] = i * WW / (PX - 1), j * WH / (PY - 1)
-					R.px[n], R.py[n], R.vx[n], R.vy[n], R.ax[n], R.ay[n] = R.rx[n], R.ry[n], 0, 0, 0, 0
-				end
-			end
-			local rx, ry = R.rx, R.ry
-			local function edge(a, b, w)
-				local dx, dy = rx[b] - rx[a], ry[b] - ry[a]
-				local lim = sqrt(dx * dx + dy * dy) * 0.32
-				table.insert(R.edges, {a, b, dx, dy, w, 1 / (lim * lim)})
-			end
-			for j = 0, PY - 1 do
-				for i = 0, PX - 1 do
-					local n = j * PX + i + 1
-					if i < PX - 1 then edge(n, n + 1, 1) end
-					if j < PY - 1 then edge(n, n + PX, 1) end
-					if i < PX - 1 and j < PY - 1 then
-						edge(n, n + PX + 1, 0.5)
-						edge(n + 1, n + PX, 0.5)
-					end
-				end
-			end
-		end
-
-		local function resetNodes(R)
-			for n = 1, NN do R.px[n], R.py[n], R.vx[n], R.vy[n] = R.winX + R.rx[n], R.winY + R.ry[n], 0, 0 end
-		end
-
-		local function physicsStep(R, h)
-			local k, c = CFG.stiffness, CFG.damping
-			local px, py, vx, vy, ax, ay, rx, ry = R.px, R.py, R.vx, R.vy, R.ax, R.ay, R.rx, R.ry
-			for n = 1, NN do ax[n] = 0; ay[n] = 0 end
-			for _, e in ipairs(R.edges) do
-				local a, b = e[1], e[2]
-				local dx = (px[b] - px[a]) - e[3]
-				local dy = (py[b] - py[a]) - e[4]
-				local m = (dx * dx + dy * dy) * e[6]
-				if m > 8 then m = 8 end
-				local kw = k * e[5] * (1 + m)
-				ax[a] = ax[a] + dx * kw; ay[a] = ay[a] + dy * kw
-				ax[b] = ax[b] - dx * kw; ay[b] = ay[b] - dy * kw
-			end
-			local g = R.grab
-			if g then
-				local gx, gy, gvx, gvy = 0, 0, 0, 0
-				for q = 1, 4 do
-					local n, w = g.n[q], g.w[q]
-					gx = gx + w * px[n]; gy = gy + w * py[n]; gvx = gvx + w * vx[n]; gvy = gvy + w * vy[n]
-				end
-				local K_ = CFG.grab
-				local Cg = 2 * sqrt(K_) * 0.55
-				local fx = ((g.tx - gx) * K_ - gvx * Cg) / g.w2
-				local fy = ((g.ty - gy) * K_ - gvy * Cg) / g.w2
-				for q = 1, 4 do
-					local n, w = g.n[q], g.w[q]
-					ax[n] = ax[n] + fx * w; ay[n] = ay[n] + fy * w
-				end
-			end
-			local hm = R.home
-			if hm then
-				for n = 1, NN do
-					ax[n] = ax[n] + (hm.x + rx[n] - px[n]) * hm.k - vx[n] * hm.c
-					ay[n] = ay[n] + (hm.y + ry[n] - py[n]) * hm.k - vy[n] * hm.c
-				end
-			end
-			for n = 1, NN do
-				vx[n] = vx[n] + (ax[n] - c * vx[n]) * h
-				vy[n] = vy[n] + (ay[n] - c * vy[n]) * h
-				px[n] = px[n] + vx[n] * h
-				py[n] = py[n] + vy[n] * h
-			end
-			if CFG.collide then
-				local VX, VY, e = R.VX, R.VY, CFG.restitution
-				for n = 1, NN do
-					if px[n] < 0 then px[n] = 0; if vx[n] < 0 then vx[n] = -vx[n] * e; vy[n] = vy[n] * 0.92 end
-					elseif px[n] > VX then px[n] = VX; if vx[n] > 0 then vx[n] = -vx[n] * e; vy[n] = vy[n] * 0.92 end end
-					if py[n] < 0 then py[n] = 0; if vy[n] < 0 then vy[n] = -vy[n] * e; vx[n] = vx[n] * 0.92 end
-					elseif py[n] > VY then py[n] = VY; if vy[n] > 0 then vy[n] = -vy[n] * e; vx[n] = vx[n] * 0.92 end end
-				end
-			end
-		end
-
-		local function centroid(R)
-			local sx, sy = 0, 0
-			for n = 1, NN do sx = sx + R.px[n] - R.rx[n]; sy = sy + R.py[n] - R.ry[n] end
-			return sx / NN, sy / NN
-		end
-
-		local function snapToRest(R)
-			local cx, cy = centroid(R)
-			R.winX, R.winY = floor(cx + 0.5), floor(cy + 0.5)
-			if CFG.collide and R.VX > 0 then
-				R.winX = clamp(R.winX, 0, max(0, R.VX - R.WW))
-				R.winY = clamp(R.winY, 0, max(0, R.VY - R.WH))
-			end
-		end
-
-		local function settleCheck(R)
-			local ox, oy = centroid(R)
-			local maxV, maxD = 0, 0
-			for n = 1, NN do
-				local v = R.vx[n] * R.vx[n] + R.vy[n] * R.vy[n]
-				if v > maxV then maxV = v end
-				local dx, dy = R.px[n] - R.rx[n] - ox, R.py[n] - R.ry[n] - oy
-				local d = dx * dx + dy * dy
-				if d > maxD then maxD = d end
-			end
-			local homeOk = not R.home or (abs(ox - R.home.x) < 0.6 and abs(oy - R.home.y) < 0.6)
-			if maxV < 0.8 and maxD < 0.12 and homeOk then
-				snapToRest(R); resetNodes(R)
-				R.simulating, R.home = false, nil
-				R.meshDirty, R.glassDirty = true, true
-				return true
-			end
-			return false
-		end
-
-		---------------------------------------------------------------- projection + mesh updates
-		local function projX(R, x, depth) return clamp((2 * x / R.VX - 1) * depth * V.tanH * (R.VX / R.VY), -7.9, 7.9) end
-		local function projY(R, y, depth) return clamp((1 - 2 * y / R.VY) * depth * V.tanH, -7.9, 7.9) end
-
-		local function updateWinMesh(R)
-			evalList(R, R.wts.win, R.sxW, R.syW)
-			local sh = R.winSheet
-			local em, vids = sh.em, sh.vids
-			local V3 = Vector3.new
-			for k = 1, sh.n do
-				em:SetPosition(vids[k], V3(projX(R, R.sxW[k], 1), projY(R, R.syW[k], 1), -1))
-			end
-		end
-
-		-- the glass lives in the world camera's space, so screen px = local px + gui inset
-		local function gProjX(x, depth, cvx, cvy) return clamp((2 * x / cvx - 1) * depth * V.tanH * (cvx / cvy), -7.9, 7.9) end
-		local function gProjY(y, depth, cvy) return clamp((1 - 2 * y / cvy) * depth * V.tanH, -7.9, 7.9) end
-
-		local function updateGlass(R)
-			if not R.glassPart.Parent then return end
-			evalList(R, R.wts.glass, R.gX, R.gY)
-			local sh = R.glassSheet
-			local em, vids, nF, nB = sh.em, sh.vids, sh.nF, sh.nB
-			local amt = CFG.refract * 0.45
-			local V3 = Vector3.new
-			local cvx, cvy = V.cvx, V.cvy
-			local gx_, gy_, gz_ = R.gx_, R.gy_, R.gz_
-			for k = 1, sh.n do
-				local depth = DG * (1 + amt * R.gProf[k])
-				local wx, wy = gProjX(R.gX[k], depth, cvx, cvy), gProjY(R.gY[k] + V.insetY, depth, cvy)
-				gx_[k], gy_[k], gz_[k] = wx, wy, -depth
-				em:SetPosition(vids[k], V3(wx, wy, -depth))
-			end
-			local n1 = GRX + 1
-			for j = 0, GRY do
-				for i = 0, GRX do
-					local k = j * n1 + i + 1
-					local kl, kr = (i > 0) and k - 1 or k, (i < GRX) and k + 1 or k
-					local ku, kd = (j > 0) and k - n1 or k, (j < GRY) and k + n1 or k
-					local ux, uy, uz = gx_[kr] - gx_[kl], gy_[kr] - gy_[kl], gz_[kr] - gz_[kl]
-					local wx, wy, wz = gx_[ku] - gx_[kd], gy_[ku] - gy_[kd], gz_[ku] - gz_[kd]
-					local nx, ny, nz = uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx
-					local l = sqrt(nx * nx + ny * ny + nz * nz)
-					if l > 1e-9 then
-						nx, ny, nz = nx / l, ny / l, nz / l
-						em:SetNormal(nF[k], V3(nx, ny, nz))
-						em:SetNormal(nB[k], V3(-nx, -ny, -nz))
-					end
-				end
-			end
-		end
-
-		---------------------------------------------------------------- rig = per-window mesh state
-		-- (re)computes everything that depends on the window size
-		local function layoutRig(R, WW, WH)
-			R.WW, R.WH = WW, WH
-			R.TXW, R.TXH = (WW + 2 * MG) * SS, (WH + 2 * MG) * SS
-			-- new texture (EditableImage size is fixed at creation)
-			if R.winImg then pcall(function() R.winImg:Destroy() end) end
-			R.winImg = AssetService:CreateEditableImage({Size = Vector2.new(R.TXW, R.TXH)})
-			R.canvas = buffer.create(R.TXW * R.TXH * 4)
-			drawBackground(R)
-			R.winImg:WritePixelsBuffer(Vector2.zero, Vector2.new(R.TXW, R.TXH), R.canvas)
-			R.canvas = nil -- free the 2.5 MB buffer, it is rebuilt on the next resize
-			local mp = R.winSheet.mp
-			local sa = mp:FindFirstChildOfClass("SurfaceAppearance")
-			if sa then
-				sa.ColorMapContent = Content.fromObject(R.winImg)
-			else
-				mp.TextureContent = Content.fromObject(R.winImg)
-			end
-			layoutSheet(R.winSheet, WW, WH)
-			layoutSheet(R.glassSheet, WW, WH)
-			R.gU, R.gV, R.gProf = {}, {}, {}
-			local r = CFG.radius
-			for k = 1, R.glassSheet.n do
-				local u, v = R.glassSheet.us[k], R.glassSheet.vs[k]
-				local cxr, cyr = clamp(u, r, WW - r), clamp(v, r, WH - r)
-				local dx, dy = u - cxr, v - cyr
-				local d = sqrt(dx * dx + dy * dy)
-				if d > r and d > 0 then u, v = cxr + dx / d * r, cyr + dy / d * r end
-				R.gU[k], R.gV[k] = u, v
-				local p = 1 - clamp(-sdRound(u, v, 0, 0, WW, WH, r) / 34, 0, 1)
-				R.gProf[k] = p * p
-			end
-			initNodes(R)
-			R.wts = {
-				win = buildWeights(WW, WH, R.winSheet.us, R.winSheet.vs, R.winSheet.n),
-				glass = buildWeights(WW, WH, R.gU, R.gV, R.glassSheet.n),
-			}
-			R.sxW, R.syW, R.gX, R.gY = {}, {}, {}, {}
-			R.gx_, R.gy_, R.gz_ = {}, {}, {}
-			R.simulating, R.grab, R.home = false, nil, nil
-			R.meshDirty, R.glassDirty = true, true
-		end
-
-		local function destroyRig(R)
-			for _, o in ipairs({R.vf, R.glassPart, R.winImg, R.winSheet and R.winSheet.em, R.glassSheet and R.glassSheet.em}) do
-				if o then pcall(function() o:Destroy() end) end
-			end
-			R.ready = false
-		end
-
-		local function buildRig(R)
-			local win = R.window
-			local sz = win.GuiElems.Main.AbsoluteSize
-			local WW, WH = floor(sz.X + 0.5), floor(sz.Y + 0.5)
-			local ok, err = pcall(function()
-				local vf = Instance.new("ViewportFrame")
-				vf.Name = "SkinViewport"
-				vf.BackgroundTransparency = 1
-				vf.Size = UDim2.fromScale(1, 1)
-				vf.Ambient = Color3.new(1, 1, 1)
-				vf.LightColor = Color3.new(0, 0, 0)
-				vf.ZIndex = 1
-				vf.Active = false
-				vf.Visible = false
-				vf.Parent = win.Gui
-				R.vf = vf
-				R.vcam = Instance.new("Camera")
-				R.vcam.CFrame = CFrame.new()
-				R.vcam.Parent = vf
-				vf.CurrentCamera = R.vcam
-
-				R.winSheet = newSheet(RX, RY, false)
-				R.glassSheet = newSheet(GRX, GRY, true)
-				layoutSheet(R.winSheet, WW, WH)
-				layoutSheet(R.glassSheet, WW, WH)
-				R.winSheet.mp = sheetPart(R.winSheet)
-				R.glassSheet.mp = sheetPart(R.glassSheet)
-
-				local mp = R.winSheet.mp
-				local sa = useAlpha and trySA()
-				if sa then sa.Parent = mp end
-				mp.Material = Enum.Material.SmoothPlastic
-				mp.Color = Color3.new(1, 1, 1)
-				mp.Parent = vf
-
-				local gp = R.glassSheet.mp
-				gp.Material = Enum.Material.Glass
-				gp.Name = "DexSkinGlass"
-				gp.Color = C3(CFG.tint)
-				gp.Reflectance = CFG.reflect
-				R.glassPart = gp
-
-				layoutRig(R, WW, WH)
-			end)
-			if not ok then
-				warn("[BAD DEX Skin] mesh rig failed, using plain glass frame: " .. tostring(err))
-				destroyRig(R)
-				R.failed = true
-				return false
-			end
-			R.winX, R.winY = 0, 0
-			R.ready = true
-			return true
-		end
-
-		---------------------------------------------------------------- chrome (title bar, traffic lights, fallback frame)
-		local function mkLight(parent, color, x, glyph)
-			local b = Instance.new("TextButton")
-			b.Name = "SkinLight"
-			b.AutoButtonColor = false
-			b.Text = ""
-			b.BorderSizePixel = 0
-			b.BackgroundColor3 = C3(color)
-			b.Size = UDim2.fromOffset(12, 12)
-			b.Position = UDim2.fromOffset(x, 4)
-			b.ZIndex = 5
-			local c = Instance.new("UICorner")
-			c.CornerRadius = UDim.new(1, 0)
-			c.Parent = b
-			local t = Instance.new("TextLabel")
-			t.BackgroundTransparency = 1
-			t.Size = UDim2.fromScale(1, 1)
-			t.Text = glyph
-			t.TextSize = 11
-			t.TextColor3 = Color3.fromRGB(60, 20, 10)
-			t.TextTransparency = 1
-			t.ZIndex = 6
-			if FONT_MED then t.FontFace = FONT_MED end
-			t.Parent = b
-			b.MouseEnter:Connect(function() t.TextTransparency = 0.1 end)
-			b.MouseLeave:Connect(function() t.TextTransparency = 1 end)
-			b.Parent = parent
-			return b
-		end
-
-		local function applyChrome(R)
-			local win = R.window
-			local e = win.GuiElems
-			local main, bar = e.Main, e.TopBar
-			-- fallback glass frame (visible whenever the mesh is not)
-			local fb = Instance.new("Frame")
-			fb.Name = "SkinFallback"
-			fb.BorderSizePixel = 0
-			fb.BackgroundColor3 = C3(ST.bg)
-			fb.BackgroundTransparency = 0.35
-			fb.Size = UDim2.fromScale(1, 1)
-			fb.ZIndex = 0
-			fb.Visible = false
-			Instance.new("UICorner", fb).CornerRadius = UDim.new(0, CFG.radius)
-			local st = Instance.new("UIStroke")
-			st.Color = Color3.new(1, 1, 1)
-			st.Thickness = 1
-			st.Transparency = 0.25
-			st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-			st.Parent = fb
-			local gr = Instance.new("UIGradient")
-			gr.Rotation = 25
-			gr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(0.5, 0.8), NumberSequenceKeypoint.new(1, 0.1)})
-			gr.Parent = st
-			fb.Parent = main
-			R.fallback = fb
-
-			-- traffic lights (replace Dex's close / minimise images)
-			R.lights = {}
-			R.lights.close = mkLight(bar, ST.close, 6, "x")
-			R.lights.min = mkLight(bar, ST.min, 22, "-")
-			R.lights.center = mkLight(bar, ST.center, 38, "+")
-			R.lights.close.MouseButton1Click:Connect(function()
-				if win.Closed then return end
-				win:Close()
-			end)
-			R.lights.min.MouseButton1Click:Connect(function()
-				if win.Closed then return end
-				if win.Aligned then win:SetAligned(false) else win:SetMinimized() end
-			end)
-			R.lights.center.MouseButton1Click:Connect(function()
-				Skin.Center(win)
-			end)
-			for _, l in pairs(R.lights) do l.Visible = false end
-			R.chromeOn = false
-		end
-
-		-- applies / removes the Skidnet look depending on the window mode (floating vs docked to a side)
-		local function setChrome(R, on)
-			if R.chromeOn == on then return end
-			R.chromeOn = on
-			local e = R.window.GuiElems
-			for _, l in pairs(R.lights) do l.Visible = on end
-			e.Close.Visible, e.Minimize.Visible = not on, not on
-			if not on then
-				e.Title.Position, e.Title.Size, e.Title.TextXAlignment = UDim2.new(0, 5, 0, 0), UDim2.new(1, -10, 0, 20), Enum.TextXAlignment.Left
-				e.TopBar.BackgroundTransparency = 0
-				e.Outlines.Visible = true
-				R.fallback.Visible = false
-				pcall(function()
-					e.Title.Font = Enum.Font.SourceSans
-					e.Title.TextSize = 14
-					if R.origContent then e.Content.BackgroundColor3 = R.origContent end
-				end)
-				return
-			end
-			R.origContent = R.origContent or e.Content.BackgroundColor3
-			e.Title.Position, e.Title.Size, e.Title.TextXAlignment = UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 20), Enum.TextXAlignment.Center
-			e.Title.TextColor3 = C3(ST.text)
-			if FONT_MED then e.Title.FontFace = FONT_MED end
-			e.Title.TextSize = 13
-			local cr = e.Main:FindFirstChildOfClass("UICorner")
-			if cr then cr.CornerRadius = UDim.new(0, CFG.radius) end
-			local cc = e.Content:FindFirstChildOfClass("UICorner") or Instance.new("UICorner", e.Content)
-			cc.CornerRadius = UDim.new(0, max(CFG.radius, 4))
-			e.Content.ClipsDescendants = true
-			e.Content.BackgroundColor3 = C3(ST.bg)
-			e.Main.ZIndex = 2
-		end
-
-		-- keeps properties that Dex's own code resets (e.g. Show() sets TopBar/Outlines back) in the skinned state
-		local function syncChrome(R, meshOn)
-			local e = R.window.GuiElems
-			if R.chromeOn then
-				if e.TopBar.BackgroundTransparency ~= 1 then e.TopBar.BackgroundTransparency = 1 end
-				if e.Outlines.Visible then e.Outlines.Visible = false end
-				local fbVisible = not meshOn and not R.window.Closed
-				if R.fallback.Visible ~= fbVisible then R.fallback.Visible = fbVisible end
-				if e.Close.Visible then e.Close.Visible = false end
-				if e.Minimize.Visible then e.Minimize.Visible = false end
-			end
-		end
-
-		---------------------------------------------------------------- pointer / grab
-		local function pointer(R)
-			local g = R.grab
-			if g and g.touch and lastTouch then return lastTouch end
-			local m = UIS:GetMouseLocation()
-			return Vector2.new(m.X, m.Y - V.insetY)
-		end
-
-		local function rigOrigin(R)
-			local vp = R.vf.AbsolutePosition
-			local mp = R.window.GuiElems.Main.AbsolutePosition
-			return mp.X - vp.X, mp.Y - vp.Y
-		end
-
-		---------------------------------------------------------------- per-frame
-		local function poke(R, u, v, power)
-			R.simulating = true
-			for n = 1, NN do
-				local dx, dy = R.rx[n] - u, R.ry[n] - v
-				local d = sqrt(dx * dx + dy * dy) + 1
-				local f = exp(-(d * d) / (2 * 120 * 120)) * (power or 620)
-				R.vx[n] = R.vx[n] + dx / d * f; R.vy[n] = R.vy[n] + dy / d * f
-			end
-		end
-
-		local function meshWanted(R)
-			local win = R.window
-			if not (Skin.Enabled and R.ready and not R.failed and not Skin.Hidden) then return false end
-			if win.Closed or win.Aligned or win.Minimized or win.Resizing then return false end
-			if not win.Gui.Parent then return false end
-			return true
-		end
-
-		local function stepRig(R, dt)
-			local win = R.window
-			local main = win.GuiElems.Main
-			if not R.chromeOn and not win.Aligned then setChrome(R, true) end
-			if R.chromeOn and win.Aligned then setChrome(R, false) end
-
-			local sz = main.AbsoluteSize
-
-			-- lazy build (CreateMeshPartAsync yields, so it runs in its own thread)
-			if not R.ready and not R.failed and not R.building and Skin.Enabled and not win.Closed and not win.Aligned
-				and not win.Minimized and not win.Resizing and win.Gui.Parent and sz.X >= 80 and sz.Y >= 60
-				and abs(sz.X - win.SizeX) < 1.5 and abs(sz.Y - win.SizeY) < 1.5 then
-				R.building = true
-				task.spawn(function()
-					buildRig(R)
-					R.building = false
-				end)
-			end
-
-			if not R.ready then syncChrome(R, false) return end
-			local sizeOk = floor(sz.X + 0.5) == R.WW and floor(sz.Y + 0.5) == R.WH
-			local want = meshWanted(R)
-
-			-- window got resized (Dex handle / tween): mesh is rebuilt once the size is stable
-			if R.ready and not sizeOk and not win.Closed and not win.Aligned and not win.Minimized and not win.Resizing and sz.X > 80 and sz.Y > 60 then
-				if R.lastSz ~= sz then R.lastSz = sz; R.sizeStable = 0 else R.sizeStable = (R.sizeStable or 0) + dt end
-				if R.sizeStable > 0.2 and not R.busy then
-					R.busy = true
-					task.spawn(function()
-						local ok, err = pcall(layoutRig, R, floor(sz.X + 0.5), floor(sz.Y + 0.5))
-						if not ok then warn("[BAD DEX Skin] relayout failed: " .. tostring(err)) R.failed = true end
-						R.winX, R.winY = 0, 0
-						R.needSync = true
-						R.busy = false
-						R.lastSz, R.sizeStable = nil, 0
-						R.popOnShow = true
-					end)
-				end
-			elseif sizeOk then
-				R.lastSz, R.sizeStable = nil, 0
-			end
-			if not sizeOk or R.busy then want = false end
-
-			local meshOn = want
-			if meshOn ~= R.meshOn then
-				R.meshOn = meshOn
-				R.vf.Visible = meshOn
-				R.glassPart.Parent = (meshOn and useAlpha and Skin.UseGlass and cam) or nil
-				R.meshDirty, R.glassDirty, R.needSync = true, true, true
-				if meshOn and R.popOnShow then R.popOnShow = nil poke(R, R.WW / 2, R.WH / 2, 380) end
-			end
-			syncChrome(R, meshOn)
-			if not meshOn then
-				R.simulating, R.grab, R.home = false, nil, nil
-				return
-			end
-
-			R.VX, R.VY = R.vf.AbsoluteSize.X, R.vf.AbsoluteSize.Y
-			if R.VX < 1 or R.VY < 1 then return end
-
-			if not R.simulating then
-				-- follow Dex moving the window (tweens, MoveInBoundary, docking...)
-				local ox, oy = rigOrigin(R)
-				ox, oy = floor(ox + 0.5), floor(oy + 0.5)
-				if R.needSync or ox ~= R.winX or oy ~= R.winY then
-					R.needSync = false
-					R.winX, R.winY = ox, oy
-					resetNodes(R)
-					R.meshDirty, R.glassDirty = true, true
-				end
-			else
-				local hmax = min(MAX_H, 0.9 / sqrt(CFG.stiffness * 54 + CFG.grab * 4 + 1))
-				local subs = max(1, ceil(dt / hmax))
-				local h = dt / subs
-				local g = R.grab
-				if g then
-					local p = pointer(R)
-					g.tx, g.ty = p.X + g.ox, p.Y + g.oy
-				end
-				for _ = 1, subs do physicsStep(R, h) end
-				R.meshDirty, R.glassDirty = true, true
-				-- the real window (content) rides the centre of the jelly
-				local cx, cy = centroid(R)
-				main.Position = fromOffset(cx, cy)
-				if not g then settleCheck(R) end
-				if not R.simulating then main.Position = fromOffset(R.winX, R.winY) end
-			end
-
-			if R.meshDirty then
-				R.meshDirty = false
-				R.vcam.FieldOfView = V.fov
-				updateWinMesh(R)
-			end
-			if R.glassPart.Parent then
-				R.glassPart.Transparency = 1 - (1 - CFG.glassTransp)
-				R.glassPart.CFrame = cam.CFrame
-				if R.glassDirty then
-					R.glassDirty = false
-					updateGlass(R)
-				end
-			end
-		end
-
-		---------------------------------------------------------------- public: drag hooks used by Lib.Window
-		-- true when the mesh rig took over this window's drag (Dex then must NOT set Main.Position itself)
-		function Skin.DragBegin(win)
-			local R = rigs[win]
-			if not R or not R.meshOn or not CFG.jellyClick then return false end
-			local p = UIS:GetMouseLocation()
-			local lp = Vector2.new(p.X, p.Y - V.insetY)
-			local touch = false
-			R.VX, R.VY = R.vf.AbsoluteSize.X, R.vf.AbsoluteSize.Y
-			if not R.simulating then
-				local ox, oy = rigOrigin(R)
-				R.winX, R.winY = floor(ox + 0.5), floor(oy + 0.5)
-				resetNodes(R)
-			end
-			local cx, cy = centroid(R)
-			local u = clamp(lp.X - cx, 0, R.WW)
-			local v = clamp(lp.Y - cy, 0, R.WH)
-			local fu = clamp(u / R.WW * (PX - 1), 0, PX - 1 - 1e-6)
-			local fv = clamp(v / R.WH * (PY - 1), 0, PY - 1 - 1e-6)
-			local i, j = floor(fu), floor(fv)
-			local tx, ty = fu - i, fv - j
-			local n0 = j * PX + i + 1
-			local g = {n = {n0, n0 + 1, n0 + PX, n0 + PX + 1}, w = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty}, touch = touch}
-			local gx, gy, w2 = 0, 0, 0
-			for q = 1, 4 do
-				gx = gx + g.w[q] * R.px[g.n[q]]; gy = gy + g.w[q] * R.py[g.n[q]]
-				w2 = w2 + g.w[q] * g.w[q]
-			end
-			g.w2, g.ox, g.oy, g.tx, g.ty = w2, gx - lp.X, gy - lp.Y, gx, gy
-			R.grab, R.home, R.simulating = g, nil, true
-			return true
-		end
-
-		function Skin.Drag(win)
-			local R = rigs[win]
-			return R ~= nil and R.grab ~= nil
-		end
-
-		function Skin.DragEnd(win)
-			local R = rigs[win]
-			if R then R.grab = nil end
-		end
-
-		-- docking etc.: stop the jelly and let Dex place the window
-		function Skin.Cancel(win)
-			local R = rigs[win]
-			if not R then return end
-			R.grab, R.home = nil, nil
-			if R.simulating then
-				snapToRest(R)
-				R.simulating = false
-				win.GuiElems.Main.Position = fromOffset(R.winX, R.winY)
-			end
-		end
-
-		function Skin.Center(win)
-			local R = rigs[win]
-			if not R or not R.meshOn then
-				local main = win.GuiElems.Main
-				local vs = cam and cam.ViewportSize or Vector2.new(800, 600)
-				main.Position = UDim2.fromOffset(floor(vs.X / 2 - win.SizeX / 2), floor(vs.Y / 2 - win.SizeY / 2))
-				return
-			end
-			local ox, oy = rigOrigin(R)
-			R.winX, R.winY = floor(ox + 0.5), floor(oy + 0.5)
-			if not R.simulating then resetNodes(R) end
-			R.simulating = true
-			R.grab = nil
-			R.home = {x = floor(R.VX / 2 - R.WW / 2), y = floor(R.VY / 2 - R.WH / 2), k = 60, c = 7}
-		end
-
-		---------------------------------------------------------------- watermark (RightCtrl)
-		local WM = {}
-		local function buildWatermark()
-			local g = Instance.new("ScreenGui")
-			g.Name = "DexSkinWatermark"
-			g.ResetOnSpawn = false
-			g.DisplayOrder = 100500
-			g.IgnoreGuiInset = true
-			pcall(function() Main.SecureGui(g) end)
-			if not g.Parent then g.Parent = Players.LocalPlayer:WaitForChild("PlayerGui") end
-			local wm = Instance.new("TextButton")
-			wm.Name = "Watermark"
-			wm.Text = ""
-			wm.AutoButtonColor = false
-			wm.BorderSizePixel = 0
-			wm.Size = fromOffset(220, 32)
-			wm.AnchorPoint = Vector2.new(0.5, 0)
-			wm.Position = UDim2.new(0.5, 0, 0, 14)
-			wm.Visible = false
-			wm.ZIndex = 20
-			wm.BackgroundColor3 = C3(ST.bg)
-			wm.BackgroundTransparency = 0.45
-			Instance.new("UICorner", wm).CornerRadius = UDim.new(1, 0)
-			local st = Instance.new("UIStroke")
-			st.Color, st.Thickness, st.Transparency, st.ApplyStrokeMode = Color3.new(1, 1, 1), 1, 0.25, Enum.ApplyStrokeMode.Border
-			st.Parent = wm
-			local gr = Instance.new("UIGradient")
-			gr.Rotation = 25
-			gr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(0.5, 0.8), NumberSequenceKeypoint.new(1, 0.1)})
-			gr.Parent = st
-			WM.scale = Instance.new("UIScale")
-			WM.scale.Parent = wm
-			local dot = Instance.new("Frame")
-			dot.Size, dot.Position, dot.BorderSizePixel, dot.BackgroundColor3 = fromOffset(8, 8), fromOffset(13, 12), 0, C3(ST.accent)
-			Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
-			dot.Parent = wm
-			local txt = Instance.new("TextLabel")
-			txt.BackgroundTransparency = 1
-			txt.TextSize = 13
-			txt.RichText = true
-			txt.TextColor3 = C3(ST.text)
-			txt.Position, txt.Size = fromOffset(28, 0), fromOffset(180, 32)
-			txt.TextXAlignment = Enum.TextXAlignment.Left
-			if FONT_MED then txt.FontFace = FONT_MED end
-			txt.Parent = wm
-			wm.Parent = g
-			WM.gui, WM.frame, WM.text = g, wm, txt
-			wm.MouseButton1Click:Connect(function() Skin.SetHidden(false) end)
-		end
-
-		local fps, fpsN, fpsT = 60, 0, 0
-		local function updateWatermark()
-			if not WM.frame or not WM.frame.Visible then return end
-			local plr = Players.LocalPlayer
-			local ping = 0
-			pcall(function() ping = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue() end)
-			if ping == 0 then pcall(function() ping = plr:GetNetworkPing() * 2000 end) end
-			local sep = '<font color="#9aa3ad">  ·  </font>'
-			WM.text.Text = "BAD DEX" .. sep .. (plr and plr.DisplayName or "Player") .. sep .. floor(fps + 0.5) .. " FPS" .. sep .. floor(ping + 0.5) .. " ms"
-			local w = WM.text.TextBounds.X
-			if w > 0 then
-				WM.frame.Size = fromOffset(w + 42, 32)
-				WM.text.Size = fromOffset(w + 10, 32)
-			end
-		end
-
-		-- [SKIN:HIDE] RightCtrl: collapse every Dex window + the launcher into the watermark pill and back
-		function Skin.SetHidden(on)
-			if on == Skin.Hidden then return end
-			Skin.Hidden = on
-			for win in pairs(rigs) do pcall(function() win.Gui.Enabled = not on end) end
-			if Lib.Window.SetSidesEnabled then pcall(Lib.Window.SetSidesEnabled, not on) end
-			pcall(function() Main.MainGui.Enabled = not on end)
-			if not WM.frame then buildWatermark() end
-			WM.frame.Visible = on
-			if on then
-				updateWatermark()
-				WM.scale.Scale = 0.4
-				TweenService:Create(WM.scale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
-			end
-		end
-
-		---------------------------------------------------------------- lifecycle
-		local initialised = false
-		local function frame(dt)
-			dt = min(dt, 1 / 15)
-			cam = workspace.CurrentCamera
-			if not cam then return end
-			local vs = cam.ViewportSize
-			V.cvx, V.cvy = vs.X, vs.Y
-			V.insetY = GuiService:GetGuiInset().Y
-			if cam.FieldOfView ~= V.fov then
-				V.fov = cam.FieldOfView
-				V.tanH = math.tan(math.rad(V.fov) / 2)
-				for _, R in ipairs(rigList) do R.meshDirty, R.glassDirty = true, true end
-			end
-			fpsN = fpsN + 1; fpsT = fpsT + dt
-			if fpsT >= 0.5 then
-				fps = fpsN / fpsT
-				fpsN, fpsT = 0, 0
-				updateWatermark()
-			end
-			for _, R in ipairs(rigList) do
-				local ok, err = pcall(stepRig, R, dt)
-				if not ok and not R.warned then
-					R.warned = true
-					warn("[BAD DEX Skin] " .. tostring(err))
-				end
-			end
-		end
-
-		local function init()
-			if initialised then return end
-			initialised = true
-			cam = workspace.CurrentCamera
-			table.insert(conns, UIS.InputChanged:Connect(function(input)
-				if input.UserInputType == Enum.UserInputType.Touch then
-					lastTouch = Vector2.new(input.Position.X, input.Position.Y)
-				end
-			end))
-			table.insert(conns, UIS.InputBegan:Connect(function(input, processed)
-				if input.KeyCode == Enum.KeyCode.RightControl and not UIS:GetFocusedTextBox() then
-					Skin.SetHidden(not Skin.Hidden)
-				end
-			end))
-			RunService:BindToRenderStep("DexSkin", Enum.RenderPriority.Camera.Value + 1, frame)
-		end
-
-		-- called by Lib.Window.new for every window
-		function Skin.Attach(win)
-			if rigs[win] then return end
-			local R = {window = win, ready = false, VX = 0, VY = 0, winX = 0, winY = 0}
-			rigs[win] = R
-			table.insert(rigList, R)
-			applyChrome(R)
-			init()
-			-- the mesh itself is built lazily on the first frame the window is really visible (see stepRig)
-			if not checkSupport() then R.failed = true end
-		end
-
-		function Skin.Detach(win)
-			local R = rigs[win]
-			if not R then return end
-			rigs[win] = nil
-			local i = table.find(rigList, R)
-			if i then table.remove(rigList, i) end
-			destroyRig(R)
-		end
-
-		function Skin.Destroy()
-			pcall(function() RunService:UnbindFromRenderStep("DexSkin") end)
-			for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-			conns = {}
-			for win, R in pairs(rigs) do destroyRig(R) end
-			if WM.gui then WM.gui:Destroy() end
-		end
-
-		return Skin
-	end)()
-
 	Lib.Window = (function()
 		local funcs = {}
 		local static = {MinWidth = 200, FreeWidth = 200}
@@ -7394,14 +6316,12 @@ local function main()
 						local alignInsertPos, alignInsertSide
 
 						guiDragging = true
-						if not self.Aligned then Lib.Skin.DragBegin(self) end
 
 						releaseEvent = service.UserInputService.InputEnded:Connect(function(input)
 							if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 								releaseEvent:Disconnect()
 								if mouseEvent then mouseEvent:Disconnect() end
 								guiDragging = false
-								if alignInsertSide then Lib.Skin.Cancel(self) else Lib.Skin.DragEnd(self) end
 								alignIndicator.Parent = nil
 								if alignInsertSide then
 									local targetSide = (alignInsertSide == "left" and leftSide) or (alignInsertSide == "right" and rightSide)
@@ -7423,9 +6343,7 @@ local function main()
 									local inputX, inputY = input.Position.X, input.Position.Y
 									local posX, posY = inputX - offX, inputY - offY
 									if posY < 0 then posY = 0 end
-									if not Lib.Skin.Drag(self) then
-										guiMain.Position = UDim2.new(0, posX, 0, posY)
-									end
+									guiMain.Position = UDim2.new(0, posX, 0, posY)
 
 									if self.Resizable and self.Alignable then
 										if inputX < 25 then
@@ -7971,7 +6889,6 @@ local function main()
 			self.Aligned = false
 			--self.Gui.Parent = nil
 			updateWindows(true)
-			pcall(Lib.Skin.Detach, self)
 			self.Gui:Destroy()
 		end
 
@@ -8214,12 +7131,7 @@ local function main()
 				OnRestore = Lib.Signal.new()
 			},mt)
 			obj.Gui = createGui(obj)
-			Lib.Skin.Attach(obj)
 			return obj
-		end
-
-		static.SetSidesEnabled = function(v)
-			if sidesGui then sidesGui.Enabled = v end
 		end
 
 		return static
@@ -12054,14 +10966,15 @@ end,
 --[[
 	Spies App Module (BAD DEX)
 
-	UtopiaSpy / Cobalt / Hydroxide / Closure Spy / Hook Spy / Metatable Spy
+	Utopia Spy / Cobalt / Hydroxide / Closure Spy / Hook Spy / Metatable Spy
 	+ Originals (loads the real tools) in a single window with tabs.
 
 	Search for "[SPIES:" to jump to the places meant for editing:
 	  [SPIES:SERIALIZE]      value -> Lua text
 	  [SPIES:CODEGEN]        remote call -> runnable snippet
 	  [SPIES:PANEL]          tab/panel builder
-	  [SPIES:NAMECALL-HOOK]  global __namecall hook (UtopiaSpy + Cobalt)
+	  [SPIES:UTOPIA-RECORD] / [SPIES:UTOPIA-HOOKS] / [SPIES:UTOPIA-INCOMING]  Utopia tab
+	  [SPIES:NAMECALL-HOOK]  global __namecall hook (Cobalt)
 	  [SPIES:REMOTE-HOOK]    per-call logic: filter / rewrite / block
 	  [SPIES:DIRECT-HOOK]    remote.FireServer(remote, ...) form
 	  [SPIES:CLOSURE-HOOK]   Closure Spy wrapper
@@ -12070,10 +10983,6 @@ end,
 	  [SPIES:META-HOOKS]     Metatable tab hooks
 	  [SPIES:HTTP] / [SPIES:ORIGINALS]  Originals tab loader + script list
 	  [SPIES:TABS]           tab list
-	  [SPIES:UTOPIA]         UtopiaSpy settings (blacklistedNames, maxTableDepth, ...)
-	  [SPIES:UTOPIA-CODEGEN] UtopiaSpy code generator (get_path / get_real_value / convert_to_code)
-	  [SPIES:UTOPIA-CLIENTINVOKE] OnClientInvoke logging
-	  [SPIES:UTOPIA-SRC]     embedded original UtopiaSpy script (Originals tab)
 ]]
 
 -- Common Locals
@@ -12103,1727 +11012,8 @@ local function initAfterMain()
 	Notebook = Apps.Notebook
 end
 
-local function main()
-	local Spies = {}
-	local window, tabBar, body
-	local tabs = {}
-	local currentTab
-
-	local RunService = game:GetService("RunService")
-	local ge = (getgenv and getgenv()) or _G
-
-	---------------------------------------------------------------------
-	-- Helpers
-	---------------------------------------------------------------------
-	-- snapshot the hook functions before Hook Spy can wrap them (our own calls must never be logged)
-	local ORIG = {}
-	for _, n in ipairs({"hookfunction", "hookmetamethod", "replaceclosure", "setrawmetatable", "setreadonly", "make_writeable", "restorefunction"}) do
-		ORIG[n] = (env and env[n]) or ge[n]
-	end
-
-	local function G(name)
-		if ORIG[name] ~= nil then return ORIG[name] end
-		local v = env and env[name]
-		if v ~= nil then return v end
-		v = ge[name]
-		if v ~= nil then return v end
-		return nil
-	end
-
-	local function theme(name, fallback)
-		local ok, v = pcall(function() return Settings.Theme[name] end)
-		if ok and v then return v end
-		return fallback
-	end
-
-	local function copyText(text)
-		local f = G("setclipboard") or G("toclipboard") or G("set_clipboard")
-		if f then pcall(f, text) return true end
-		return false
-	end
-
-	local function nowStr() return os.date("%X") end
-	local function pack(...) return {n = select("#", ...), ...} end
-	local unpack = table.unpack or unpack
-
-	local function safeComment(s)
-		return (tostring(s):gsub("%]%]", "] ]"):gsub("[\r\n]+", " "))
-	end
-
-	local function traceBlock(t)
-		return (tostring(t):gsub("%]%]", "] ]"):gsub("\t", "  "))
-	end
-
-	local keywords = {}
-	for w in ("and break do else elseif end false for function if in local nil not or repeat return then true until while continue"):gmatch("%a+") do
-		keywords[w] = true
-	end
-
-	local function validIdent(s)
-		return type(s) == "string" and s:match("^[%a_][%w_]*$") ~= nil and not keywords[s]
-	end
-
-	local function esc(s)
-		local r = s:gsub('[%c"\\]', function(c)
-			if c == '"' then return '\\"'
-			elseif c == "\\" then return "\\\\"
-			elseif c == "\n" then return "\\n"
-			elseif c == "\r" then return "\\r"
-			elseif c == "\t" then return "\\t" end
-			return string.format("\\%03d", c:byte())
-		end)
-		return '"' .. r .. '"'
-	end
-
-	local function nameKey(name)
-		if validIdent(name) then return "." .. name end
-		return "[" .. esc(name) .. "]"
-	end
-
-	local function isService(inst)
-		local ok, res = pcall(function() return game:GetService(inst.ClassName) == inst end)
-		return ok and res
-	end
-
-	local function pathOf(inst)
-		if inst == nil then return "nil" end
-		if inst == game then return "game" end
-		local chain = {}
-		local cur = inst
-		local guard = 0
-		while cur and cur ~= game and guard < 100 do
-			table.insert(chain, 1, cur)
-			cur = cur.Parent
-			guard = guard + 1
-		end
-		if cur ~= game then
-			return "nil --[[ nil-parented: " .. safeComment(inst.Name) .. " (" .. inst.ClassName .. ") ]]"
-		end
-		local out
-		local startIdx = 1
-		local lp = plr
-		if lp and chain[1] == game:GetService("Players") and chain[2] == lp then
-			out = 'game:GetService("Players").LocalPlayer'
-			startIdx = 3
-		elseif isService(chain[1]) then
-			out = 'game:GetService(' .. esc(chain[1].ClassName) .. ')'
-			startIdx = 2
-		else
-			out = "game" .. nameKey(chain[1].Name)
-			startIdx = 2
-		end
-		for i = startIdx, #chain do
-			out = out .. nameKey(chain[i].Name)
-		end
-		return out
-	end
-
-	-- [SPIES:SERIALIZE] value -> Lua source text (Vector3, CFrame, Instances, tables, ...). Add new types in serialize().
-	local serialize
-	local function serializeTable(t, indent, seen, depth)
-		if seen[t] then return "{} --[[ cyclic ]]" end
-		if depth > 6 then return "{} --[[ max depth ]]" end
-		seen[t] = true
-		local out = {}
-		local pad = string.rep("\t", indent + 1)
-		local okn, n = pcall(function() return #t end)
-		if not okn then n = 0 end
-		local limit = 150
-		for i = 1, n do
-			if #out >= limit then out[#out + 1] = pad .. "-- ... truncated" break end
-			out[#out + 1] = pad .. serialize(rawget(t, i), indent + 1, seen, depth + 1)
-		end
-		local okp = pcall(function()
-			for k, v in next, t do
-				if #out >= limit then out[#out + 1] = pad .. "-- ... truncated" break end
-				if not (type(k) == "number" and k >= 1 and k <= n and k % 1 == 0) then
-					local ks
-					if validIdent(k) then ks = k
-					else ks = "[" .. serialize(k, indent + 1, seen, depth + 1) .. "]" end
-					out[#out + 1] = pad .. ks .. " = " .. serialize(v, indent + 1, seen, depth + 1)
-				end
-			end
-		end)
-		seen[t] = nil
-		if #out == 0 then return "{}" end
-		return "{\n" .. table.concat(out, ",\n") .. "\n" .. string.rep("\t", indent) .. "}"
-	end
-
-	local function fnName(f)
-		local getinfo = (debug and debug.getinfo) or G("getinfo")
-		local nm = "unknown"
-		if getinfo then
-			local ok, info = pcall(getinfo, f)
-			if ok and info then
-				nm = (info.name and info.name ~= "" and info.name) or nm
-			end
-		end
-		return nm
-	end
-
-	serialize = function(v, indent, seen, depth)
-		indent = indent or 0
-		seen = seen or {}
-		depth = depth or 0
-		local tv = typeof(v)
-		if tv == "string" then
-			return esc(v)
-		elseif tv == "number" then
-			if v ~= v then return "0/0 --[[ nan ]]"
-			elseif v == math.huge then return "math.huge"
-			elseif v == -math.huge then return "-math.huge"
-			elseif v % 1 == 0 and math.abs(v) < 1e15 then return string.format("%d", v) end
-			return string.format("%.14g", v)
-		elseif tv == "boolean" or tv == "nil" then
-			return tostring(v)
-		elseif tv == "table" then
-			return serializeTable(v, indent, seen, depth)
-		elseif tv == "Instance" then
-			return pathOf(v)
-		elseif tv == "function" then
-			return "function() end --[[ " .. safeComment(fnName(v)) .. " ]]"
-		elseif tv == "Vector3" then
-			return string.format("Vector3.new(%s, %s, %s)", serialize(v.X), serialize(v.Y), serialize(v.Z))
-		elseif tv == "Vector2" then
-			return string.format("Vector2.new(%s, %s)", serialize(v.X), serialize(v.Y))
-		elseif tv == "CFrame" then
-			local comps = {v:GetComponents()}
-			for i = 1, #comps do comps[i] = serialize(comps[i]) end
-			return "CFrame.new(" .. table.concat(comps, ", ") .. ")"
-		elseif tv == "Color3" then
-			return string.format("Color3.new(%s, %s, %s)", serialize(v.R), serialize(v.G), serialize(v.B))
-		elseif tv == "UDim2" then
-			return string.format("UDim2.new(%s, %s, %s, %s)", serialize(v.X.Scale), serialize(v.X.Offset), serialize(v.Y.Scale), serialize(v.Y.Offset))
-		elseif tv == "UDim" then
-			return string.format("UDim.new(%s, %s)", serialize(v.Scale), serialize(v.Offset))
-		elseif tv == "EnumItem" or tv == "Enum" then
-			return tostring(v)
-		elseif tv == "BrickColor" then
-			return "BrickColor.new(" .. esc(v.Name) .. ")"
-		elseif tv == "NumberRange" then
-			return string.format("NumberRange.new(%s, %s)", serialize(v.Min), serialize(v.Max))
-		elseif tv == "Rect" then
-			return string.format("Rect.new(%s, %s, %s, %s)", serialize(v.Min.X), serialize(v.Min.Y), serialize(v.Max.X), serialize(v.Max.Y))
-		elseif tv == "Ray" then
-			return string.format("Ray.new(%s, %s)", serialize(v.Origin), serialize(v.Direction))
-		elseif tv == "TweenInfo" then
-			return string.format("TweenInfo.new(%s, %s, %s)", serialize(v.Time), tostring(v.EasingStyle), tostring(v.EasingDirection))
-		end
-		return "nil --[[ " .. safeComment(tv) .. ": " .. safeComment(tostring(v)) .. " ]]"
-	end
-
-	local function serializeArgs(args)
-		local parts = {}
-		for i = 1, args.n do
-			local ok, s = pcall(serialize, args[i], 0, {}, 0)
-			parts[i] = ok and s or ("nil --[[ serialize error: " .. safeComment(s) .. " ]]")
-		end
-		return parts
-	end
-
-	-- [SPIES:CODEGEN] turns a captured remote call into a runnable snippet (shown in Cobalt details; UtopiaSpy has its own generator, see [SPIES:UTOPIA-CODEGEN])
-	-- Generates a runnable snippet for a remote call
-	local function genRemoteCode(e)
-		local lines = {}
-		local dirText = e.dir == "in" and "Server -> Client" or "Client -> Server"
-		lines[#lines + 1] = "-- " .. dirText .. " | " .. safeComment(e.class) .. " | " .. e.clock
-		lines[#lines + 1] = "local remote = " .. pathOf(e.remote)
-		local exprs = serializeArgs(e.args)
-		local callArgs = {}
-		for i = 1, e.args.n do
-			if exprs[i]:find("\n", 1, true) or #exprs[i] > 90 then
-				lines[#lines + 1] = "local arg" .. i .. " = " .. exprs[i]
-				callArgs[i] = "arg" .. i
-			else
-				callArgs[i] = exprs[i]
-			end
-		end
-		local argStr = table.concat(callArgs, ", ")
-		if e.dir == "in" then
-			lines[#lines + 1] = ""
-			lines[#lines + 1] = "-- replay the incoming call on the client (needs firesignal):"
-			lines[#lines + 1] = "firesignal(remote.OnClientEvent" .. (argStr ~= "" and (", " .. argStr) or "") .. ")"
-		else
-			lines[#lines + 1] = ""
-			lines[#lines + 1] = "remote:" .. e.method .. "(" .. argStr .. ")"
-		end
-		return table.concat(lines, "\n")
-	end
-
-	---------------------------------------------------------------------
-	-- UI building blocks
-	---------------------------------------------------------------------
-	local C = {
-		Main1 = function() return theme("Main1", Color3.fromRGB(37, 37, 37)) end,
-		Main2 = function() return theme("Main2", Color3.fromRGB(46, 46, 46)) end,
-		Text = function() return theme("Text", Color3.fromRGB(230, 230, 230)) end,
-		Button = function() return theme("Button", Color3.fromRGB(60, 60, 60)) end,
-		Hover = function() return theme("ButtonHover", Color3.fromRGB(80, 80, 80)) end,
-		Sel = function() return theme("ListSelection", Color3.fromRGB(11, 90, 175)) end,
-	}
-	local COL_OUT = Color3.fromRGB(130, 190, 255)
-	local COL_IN = Color3.fromRGB(140, 230, 150)
-	local COL_BLOCK = Color3.fromRGB(240, 110, 110)
-	local COL_WARN = Color3.fromRGB(240, 200, 110)
-
-	local function mkButton(parent, text, width, onClick)
-		local b = Instance.new("TextButton")
-		b.Size = UDim2.new(0, width, 0, 20)
-		b.BackgroundColor3 = C.Button()
-		b.BorderSizePixel = 0
-		b.TextColor3 = C.Text()
-		b.Font = Enum.Font.SourceSans
-		b.TextSize = 14
-		b.AutoButtonColor = true
-		b.Text = text
-		b.Parent = parent
-		b.MouseButton1Click:Connect(function()
-			local ok, err = pcall(onClick, b)
-			if not ok then warn("[BAD DEX Spies] " .. tostring(err)) end
-		end)
-		return b
-	end
-
-	local function mkBox(parent, placeholder, width)
-		local t = Instance.new("TextBox")
-		t.Size = UDim2.new(0, width, 0, 20)
-		t.BackgroundColor3 = theme("TextBox", Color3.fromRGB(25, 25, 25))
-		t.BorderSizePixel = 0
-		t.TextColor3 = C.Text()
-		t.PlaceholderText = placeholder
-		t.PlaceholderColor3 = theme("PlaceholderText", Color3.fromRGB(120, 120, 120))
-		t.Font = Enum.Font.SourceSans
-		t.TextSize = 14
-		t.Text = ""
-		t.ClearTextOnFocus = false
-		t.TextXAlignment = Enum.TextXAlignment.Left
-		t.Parent = parent
-		return t
-	end
-
-	-- [SPIES:PANEL] makePanel() builds a tab: toolbar buttons/boxes + log list + detail box.
-	-- A panel = toolbar + log list (left) + detail box (right)
-	-- cfg.buttons = { {text, width, fn(btn, panel)} ... }, cfg.boxes = { {placeholder, width, key} ... }
-	local MAX_ROWS = 400
-	local function makePanel(cfg)
-		local P = {rows = {}, counter = 0, boxes = {}, selected = nil}
-
-		local frame = Instance.new("Frame")
-		frame.Name = cfg.name
-		frame.BackgroundTransparency = 1
-		frame.Size = UDim2.new(1, 0, 1, 0)
-		frame.Visible = false
-		frame.Parent = body
-		P.Frame = frame
-
-		local toolbar = Instance.new("ScrollingFrame")
-		toolbar.BackgroundColor3 = C.Main2()
-		toolbar.BorderSizePixel = 0
-		toolbar.Size = UDim2.new(1, 0, 0, 44)
-		toolbar.ScrollBarThickness = 3
-		toolbar.CanvasSize = UDim2.new(0, 0, 0, 0)
-		toolbar.AutomaticCanvasSize = Enum.AutomaticSize.Y
-		toolbar.ScrollingDirection = Enum.ScrollingDirection.Y
-		toolbar.Parent = frame
-		local tl = Instance.new("UIListLayout")
-		tl.FillDirection = Enum.FillDirection.Horizontal
-		tl.Wraps = true
-		tl.Padding = UDim.new(0, 3)
-		tl.SortOrder = Enum.SortOrder.LayoutOrder
-		tl.Parent = toolbar
-		local tp = Instance.new("UIPadding")
-		tp.PaddingLeft = UDim.new(0, 3)
-		tp.PaddingTop = UDim.new(0, 2)
-		tp.Parent = toolbar
-
-		for _, bx in ipairs(cfg.boxes or {}) do
-			P.boxes[bx[3]] = mkBox(toolbar, bx[1], bx[2])
-		end
-		for _, bt in ipairs(cfg.buttons or {}) do
-			local b
-			b = mkButton(toolbar, bt[1], bt[2], function() bt[3](b, P) end)
-			if bt[4] then bt[4](b, P) end
-		end
-
-		local list = Instance.new("ScrollingFrame")
-		list.BackgroundColor3 = C.Main1()
-		list.BorderSizePixel = 0
-		list.Position = UDim2.new(0, 0, 0, 46)
-		list.Size = UDim2.new(0.42, -2, 1, -46)
-		list.ScrollBarThickness = 8
-		list.CanvasSize = UDim2.new(0, 0, 0, 0)
-		list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-		list.Parent = frame
-		local ll = Instance.new("UIListLayout")
-		ll.SortOrder = Enum.SortOrder.LayoutOrder
-		ll.Parent = list
-		P.List = list
-
-		local detail = Instance.new("TextBox")
-		detail.BackgroundColor3 = C.Main1()
-		detail.BorderSizePixel = 0
-		detail.Position = UDim2.new(0.42, 0, 0, 46)
-		detail.Size = UDim2.new(0.58, 0, 1, -46)
-		detail.TextColor3 = C.Text()
-		detail.Font = Enum.Font.Code
-		detail.TextSize = 13
-		detail.TextXAlignment = Enum.TextXAlignment.Left
-		detail.TextYAlignment = Enum.TextYAlignment.Top
-		detail.ClearTextOnFocus = false
-		detail.MultiLine = true
-		detail.TextWrapped = false
-		detail.Text = cfg.hint or ""
-		detail.Parent = frame
-		P.Detail = detail
-
-		function P.setDetail(text)
-			if #text > 60000 then text = text:sub(1, 60000) .. "\n-- ... output truncated" end
-			detail.Text = text
-		end
-
-		function P.addRow(text, color, data, onSelect)
-			P.counter = P.counter + 1
-			local btn = Instance.new("TextButton")
-			btn.Size = UDim2.new(1, 0, 0, 18)
-			btn.BackgroundColor3 = C.Main1()
-			btn.BorderSizePixel = 0
-			btn.AutoButtonColor = false
-			btn.Font = Enum.Font.SourceSans
-			btn.TextSize = 14
-			btn.TextColor3 = color or C.Text()
-			btn.TextXAlignment = Enum.TextXAlignment.Left
-			btn.TextTruncate = Enum.TextTruncate.AtEnd
-			btn.Text = " " .. text
-			btn.LayoutOrder = cfg.oldestFirst and P.counter or -P.counter
-			btn.Parent = list
-			local row = {Button = btn, Data = data, Color = color}
-			P.rows[#P.rows + 1] = row
-			btn.MouseButton1Click:Connect(function()
-				if P.selected then P.selected.Button.BackgroundColor3 = C.Main1() end
-				P.selected = row
-				btn.BackgroundColor3 = C.Sel()
-				if onSelect then
-					local ok, err = pcall(onSelect, row)
-					if not ok then P.setDetail("-- error while rendering details:\n" .. tostring(err)) end
-				end
-			end)
-			if #P.rows > MAX_ROWS then
-				local old = table.remove(P.rows, 1)
-				if P.selected == old then P.selected = nil end
-				old.Button:Destroy()
-			end
-			return row
-		end
-
-		function P.clear()
-			for _, r in ipairs(P.rows) do r.Button:Destroy() end
-			P.rows = {}
-			P.selected = nil
-			detail.Text = ""
-		end
-
-		function P.setRowColor(row, color)
-			row.Color = color
-			row.Button.TextColor3 = color or C.Text()
-		end
-
-		return P
-	end
-
-	local function addTab(name, buildFn)
-		local t = {Name = name}
-		tabs[#tabs + 1] = t
-		local idx = #tabs
-		local b = Instance.new("TextButton")
-		b.Size = UDim2.new(1 / 7, -2, 1, 0)
-		b.BackgroundColor3 = C.Button()
-		b.BorderSizePixel = 0
-		b.TextColor3 = C.Text()
-		b.Font = Enum.Font.SourceSansBold
-		b.TextSize = 14
-		b.Text = name
-		b.LayoutOrder = idx
-		b.Parent = tabBar
-		t.Button = b
-		t.Panel = buildFn()
-		b.MouseButton1Click:Connect(function() Spies.SelectTab(idx) end)
-		return t
-	end
-
-	Spies.SelectTab = function(idx)
-		for i, t in ipairs(tabs) do
-			local on = i == idx
-			t.Panel.Frame.Visible = on
-			t.Button.BackgroundColor3 = on and C.Sel() or C.Button()
-		end
-		currentTab = idx
-	end
-
-	---------------------------------------------------------------------
-	-- Event queue (decouples hooks from UI work)
-	---------------------------------------------------------------------
-	local queue = {}
-	local function push(fn)
-		if #queue < 2000 then queue[#queue + 1] = fn end
-	end
-	local queueCon
-	local function startQueue()
-		if queueCon then return end
-		queueCon = RunService.Heartbeat:Connect(function()
-			local n = 0
-			while #queue > 0 and n < 12 do
-				local fn = table.remove(queue, 1)
-				local ok, err = pcall(fn)
-				if not ok then warn("[BAD DEX Spies] " .. tostring(err)) end
-				n = n + 1
-			end
-		end)
-	end
-
-	---------------------------------------------------------------------
-	-- UtopiaSpy logic (replaces the SimpleSpy tab)
-	--
-	-- Port of the UtopiaSpy script's code generator: get_path / get_real_value / table_to_string /
-	-- convert_to_code / convert_to_code_client, with the same settings table and the same output
-	-- style (`Remote:FireServer(table.unpack({...}))`, `--[[function -->]]` dumps with upvalues,
-	-- constants, protos and info, `utf8.char(...)` for odd instance names, ...).
-	-- The hooks themselves (namecall / FireServer / InvokeServer / OnClientEvent / OnClientInvoke)
-	-- live in the shared remote engine below.
-	--
-	-- [SPIES:UTOPIA] tunables - edit these values to taste:
-	---------------------------------------------------------------------
-	local Utopia = {
-		maxTableDepth = 100,       -- same default as UtopiaSpy: deeper tables become "table_over_maxTableDepth"
-		maxTableEntries = 6000,    -- extra safety: stop dumping one value after this many entries
-		newFunctionMethod = true,  -- true: dump Lua functions as upvalues/constants/protos/info; false: "function() end"
-		blacklistedNames = {},     -- remote NAMES that are never shown, e.g. {"Heartbeat", "UpdateCamera"}
-		invokeClientHook = true,   -- hook OnClientInvoke callbacks (needs getcallbackmember + hookfunction)
-	}
-	Spies.Utopia = Utopia
-	local utopiaDepth, utopiaCount = 0, 0
-	local utopiaPath, utopiaValue
-
-	local function utopiaUtf8(s)
-		local parts = {}
-		local ok = pcall(function() for _, c in utf8.codes(s) do parts[#parts + 1] = tostring(c) end end)
-		if not ok then return esc(s) end
-		return "utf8.char(" .. table.concat(parts, ", ") .. ")"
-	end
-
-	local function utopiaEscape(s)
-		return (s:gsub("\\", "\\\\"):gsub("\0", "\\0"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
-			:gsub("\v", "\\v"):gsub("\b", "\\b"):gsub("\f", "\\f"))
-	end
-
-	-- get_path: instance -> Lua expression
-	utopiaPath = function(inst)
-		local name = inst.Name
-		local seg = (#name > 0) and ("." .. name) or "['']"
-		if not inst.Parent and inst ~= game then return seg .. " --[[ Parented to nil ]]" end
-		if inst == game then return "game" end
-		if inst == workspace then return "workspace" end
-		local okSvc, svc = pcall(game.GetService, game, inst.ClassName)
-		local part
-		local strippedWord = name:gsub("[%w_]", "")
-		if okSvc and svc then
-			part = ':GetService("' .. inst.ClassName .. '")'
-		elseif inst == plr then
-			part = ".LocalPlayer"
-		elseif tonumber(name:sub(1, 1)) or (#strippedWord ~= 0 and #(strippedWord:gsub("[%s%p]", "")) == 0) then
-			part = '["' .. name:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"]'
-		elseif #strippedWord ~= 0 and #(strippedWord:gsub("[%s%p]", "")) > 0 then
-			part = "[" .. utopiaUtf8(name) .. "]"
-		else
-			part = seg
-		end
-		return utopiaPath(inst.Parent) .. part
-	end
-
-	local function utopiaTable(t, seen)
-		utopiaDepth = utopiaDepth + 1
-		local depth = utopiaDepth
-		if Utopia.maxTableDepth + 1 < depth then
-			utopiaDepth = utopiaDepth - 1
-			return "table_over_maxTableDepth (.." .. tostring(t) .. ")"
-		end
-		if seen[t] then
-			utopiaDepth = utopiaDepth - 1
-			return "{} --[[ cyclic: " .. safeComment(tostring(t)) .. " ]]"
-		end
-		seen[t] = true
-		local pad = ("    "):rep(depth)
-		local out = {"{"}
-		local ok = pcall(function()
-			for k, v in next, t do
-				utopiaCount = utopiaCount + 1
-				if utopiaCount > Utopia.maxTableEntries then
-					out[#out + 1] = "\n" .. pad .. "--[[ truncated: maxTableEntries reached ]]"
-					break
-				end
-				out[#out + 1] = "\n" .. pad .. "[" .. utopiaValue(k, seen) .. "] = " .. utopiaValue(v, seen) .. ","
-			end
-		end)
-		if not ok then out[#out + 1] = "\n" .. pad .. "--[[ table could not be iterated ]]" end
-		seen[t] = nil
-		utopiaDepth = utopiaDepth - 1
-		return table.concat(out) .. "\n" .. ("    "):rep(utopiaDepth) .. "}"
-	end
-
-	local function utopiaFnInfo(f)
-		local getinfo = (debug and debug.getinfo) or G("getinfo")
-		local info = {}
-		if getinfo then
-			local ok, res = pcall(getinfo, f)
-			if ok and type(res) == "table" then
-				for k, v in pairs(res) do if k ~= "func" then info[k] = v end end
-			end
-		end
-		return info
-	end
-
-	local function utopiaFnDump(f)
-		local dbg = debug or {}
-		local function try(...)
-			for i = 1, select("#", ...) do
-				local fn = select(i, ...)
-				if type(fn) == "function" then
-					local ok, res = pcall(fn, f)
-					if ok then return res end
-				end
-			end
-		end
-		return {
-			upvalues = try(dbg.getupvalues, G("getupvalues")),
-			constants = try(dbg.getconstants, G("getconstants")),
-			protos = try(dbg.getprotos, G("getprotos")),
-			info = utopiaFnInfo(f),
-		}
-	end
-
-	local NORMAL_TYPES = {UDim2 = true, UDim = true, Vector3 = true, Vector2 = true, CFrame = true, Vector2int16 = true,
-		Vector3int16 = true, BrickColor = true, Color3 = true}
-
-	-- get_real_value: any value -> Lua expression text
-	utopiaValue = function(v, seen)
-		seen = seen or {}
-		local tv = typeof(v)
-		if tv == "Instance" then return utopiaPath(v) end
-		if tv == "string" then return '"' .. utopiaEscape(v) .. '"' end
-		if tv == "table" then return utopiaTable(v, seen) end
-		if tv == "function" then
-			local isL = G("islclosure")
-			if isL and isL(v) then
-				if Utopia.newFunctionMethod then
-					return "--[[function -->]] " .. utopiaTable(utopiaFnDump(v), seen)
-				end
-				return "function() end"
-			end
-			return "newcclosure(function() end)"
-		end
-		if tv == "number" then
-			if v ~= v then return "0/0" elseif v == math.huge then return "math.huge" elseif v == -math.huge then return "-math.huge" end
-			return tostring(v)
-		end
-		if tv == "UDim2" then
-			return "UDim2.new(" .. tostring(v.X.Scale) .. ", " .. tostring(v.X.Offset) .. ", " .. tostring(v.Y.Scale) .. ", " .. tostring(v.Y.Offset) .. ")"
-		end
-		if NORMAL_TYPES[tv] then
-			local inner = tv == "BrickColor" and ("'" .. tostring(v) .. "'") or tostring(v)
-			return tv .. ".new(" .. inner .. ")"
-		end
-		if tv == "TweenInfo" then
-			return "TweenInfo.new(" .. utopiaValue(v.Time) .. ", " .. utopiaValue(v.EasingStyle) .. ", " .. utopiaValue(v.EasingDirection)
-				.. ", " .. utopiaValue(v.RepeatCount) .. ", " .. utopiaValue(v.Reverses) .. ", " .. utopiaValue(v.DelayTime) .. ")"
-		end
-		if tv == "Enums" then return "Enum" end
-		if tv == "Enum" then return "Enum." .. tostring(v) end
-		if tv == "EnumItem" then return tostring(v) end
-		if tv == "Axes" or tv == "Faces" then
-			local parts = {}
-			for _, item in ipairs(Enum.NormalId:GetEnumItems()) do
-				if v[item.Name] then parts[#parts + 1] = utopiaValue(item) end
-			end
-			return tv .. ".new(" .. table.concat(parts, ", ") .. ")"
-		end
-		if tv == "ColorSequence" or tv == "NumberSequence" then
-			local parts = {}
-			for _, kp in ipairs(v.Keypoints) do parts[#parts + 1] = utopiaValue(kp) end
-			return tv .. ".new{" .. table.concat(parts, ", ") .. "}"
-		end
-		if tv == "ColorSequenceKeypoint" then return "ColorSequenceKeypoint.new(" .. tostring(v.Time) .. ", " .. utopiaValue(v.Value) .. ")" end
-		if tv == "NumberSequenceKeypoint" then
-			return "NumberSequenceKeypoint.new(" .. tostring(v.Time) .. ", " .. utopiaValue(v.Value) .. (v.Envelope and (", " .. v.Envelope) or "") .. ")"
-		end
-		if tv == "DateTime" then
-			if v.UnixTimestampMillis == DateTime.now().UnixTimestampMillis then return "DateTime.now()" end
-			return "DateTime.fromUnixTimestampMillis(" .. v.UnixTimestampMillis .. ")"
-		end
-		if tv == "FloatCurveKey" then return "FloatCurveKey.new(" .. utopiaValue(v.Time) .. ", " .. utopiaValue(v.Value) .. ", " .. utopiaValue(v.Interpolation) .. ")" end
-		if tv == "NumberRange" then return "NumberRange.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
-		if tv == "PathWaypoint" then return "PathWaypoint.new(" .. utopiaValue(v.Position) .. ", " .. utopiaValue(v.Action) .. ")" end
-		if tv == "PhysicalProperties" then
-			return "PhysicalProperties.new(" .. utopiaValue(v.Density) .. ", " .. utopiaValue(v.Friction) .. ", " .. utopiaValue(v.Elasticity)
-				.. ", " .. utopiaValue(v.FrictionWeight) .. ", " .. utopiaValue(v.ElasticityWeight) .. ")"
-		end
-		if tv == "Random" then return "Random.new()" end
-		if tv == "Ray" then return "Ray.new(" .. utopiaValue(v.Origin) .. ", " .. utopiaValue(v.Direction) .. ")" end
-		if tv == "RaycastParams" then
-			return "--[[typeof: RaycastParams ->]] {FilterDescendantsInstances = " .. utopiaValue(v.FilterDescendantsInstances) .. ", FilterType = "
-				.. utopiaValue(v.FilterType) .. ", IgnoreWater = " .. utopiaValue(v.IgnoreWater) .. ", CollisionGroup = '" .. tostring(v.CollisionGroup) .. "'}"
-		end
-		if tv == "RaycastResult" then
-			return "--[[typeof: RaycastResult ->]] {Distance = " .. utopiaValue(v.Distance) .. ", Instance = " .. utopiaValue(v.Instance)
-				.. ", Material = " .. utopiaValue(v.Material) .. ", Position = " .. utopiaValue(v.Position) .. ", Normal = " .. utopiaValue(v.Normal) .. "}"
-		end
-		if tv == "RBXScriptConnection" then return "--[[typeof: RBXScriptConnection ->]] {Connected = " .. utopiaValue(v.Connected) .. "}" end
-		if tv == "RBXScriptSignal" then return "RBXScriptSignal" end
-		if tv == "Rect" then return "Rect.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
-		if tv == "Region3" then
-			local cf, sz = v.CFrame, v.Size
-			return "Region3.new(" .. utopiaValue((cf * CFrame.new(-sz.X / 2, -sz.Y / 2, -sz.Z / 2)).p) .. ", "
-				.. utopiaValue((cf * CFrame.new(sz.X / 2, sz.Y / 2, sz.Z / 2)).p) .. ")"
-		end
-		if tv == "Region3int16" then return "Region3int16.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
-		if tv == "OverlapParams" then
-			return "--[[typeof: OverlapParams ->]] {FilterDescendantsInstances = " .. utopiaValue(v.FilterDescendantsInstances) .. ", FilterType = "
-				.. utopiaValue(v.FilterType) .. ", MaxParts =" .. utopiaValue(v.MaxParts) .. ", CollisionGroup = " .. utopiaValue(v.CollisionGroup) .. "}"
-		end
-		if tv == "userdata" then return "newproxy(true)" end
-		if v == nil then return "nil" end
-		return tostring(v)
-	end
-
-	local function utopiaGuard(f, ...)
-		utopiaDepth, utopiaCount = 0, 0
-		local ok, res = pcall(f, ...)
-		utopiaDepth, utopiaCount = 0, 0
-		if ok then return res end
-		return "nil --[[ UtopiaSpy: could not serialize: " .. safeComment(res) .. " ]]"
-	end
-
-	-- the recorded args table (pack(...)) as a `table.unpack({...}, 1, n)` argument
-	local function utopiaArgsTable(args)
-		local rows = {"{"}
-		for i = 1, args.n do
-			rows[#rows + 1] = "\n    [" .. i .. "] = " .. utopiaGuard(utopiaValue, args[i]) .. ","
-		end
-		return table.concat(rows) .. "\n}"
-	end
-
-	-- convert_to_code (outgoing: FireServer / InvokeServer)
-	local function utopiaOut(remote, args, method)
-		local r = utopiaGuard(utopiaValue, remote)
-		if args.n == 0 then return r .. ":" .. method .. "()" end
-		if args.n == 1 then return r .. ":" .. method .. "(" .. utopiaGuard(utopiaValue, args[1]) .. ")" end
-		return r .. ":" .. method .. "(table.unpack(" .. utopiaArgsTable(args) .. ", 1, " .. args.n .. "))"
-	end
-
-	-- convert_to_code_client (incoming: FireClient / InvokeClient)
-	local function utopiaIn(remote, args, method)
-		local r = utopiaGuard(utopiaValue, remote)
-		local lm = method:lower()
-		local a
-		if args.n == 0 then a = ""
-		elseif args.n == 1 then a = utopiaGuard(utopiaValue, args[1])
-		else a = "table.unpack(" .. utopiaArgsTable(args) .. ", 1, " .. args.n .. ")" end
-		if lm == "fireclient" or lm == "onclientevent" then
-			return "local Remote = " .. r .. "\nfiresignal(Remote.OnClientEvent" .. (a ~= "" and (", " .. a) or "") .. ")"
-		elseif lm == "invokeclient" then
-			return "local Remote = " .. r .. '\nlocal callback = getcallbackmember(Remote, "OnClientInvoke")\ncallback(' .. a .. ")"
-		end
-		return "-- Unknown ncm for client: " .. method
-	end
-
-	-- [SPIES:UTOPIA-CODEGEN] entry point used by the UtopiaSpy tab (Copy Code / detail view)
-	local function utopiaCode(e)
-		if e.dir == "in" then return utopiaIn(e.remote, e.args, e.method) end
-		return utopiaOut(e.remote, e.args, e.method)
-	end
-
-	---------------------------------------------------------------------
-	-- Remote engine (shared by UtopiaSpy + Cobalt)
-	---------------------------------------------------------------------
-	local Remote = {
-		installed = false,
-		simple = false, cobalt = false,
-		incoming = true, bindables = false, trace = true,
-		blocked = {}, simpleIgnored = {}, cobaltIgnored = {},
-		inCall = setmetatable({}, {__mode = "k"}),
-		incomingCons = {}, incomingConnected = false, cbHooked = setmetatable({}, {__mode = "k"}),
-		counter = 0,
-	}
-	local OUT = {FireServer = true, fireServer = true, InvokeServer = true, invokeServer = true}
-	local OUTB = {Fire = true, fire = true, Invoke = true, invoke = true}
-	local REMOTE_CLASSES = {RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true}
-	local BIND_CLASSES = {BindableEvent = true, BindableFunction = true}
-
-	local function classifyCall(obj, method)
-		local ok, cn = pcall(function() return obj.ClassName end)
-		if not ok or type(cn) ~= "string" then return nil end
-		if REMOTE_CLASSES[cn] and OUT[method] then return cn end
-		if Remote.bindables and BIND_CLASSES[cn] and OUTB[method] then return cn end
-		return nil
-	end
-
-	local dispatchRemote -- defined after panels exist
-
-	local function recordRemote(dir, remote, cn, method, args)
-		Remote.counter = Remote.counter + 1
-		local e = {
-			id = Remote.counter, dir = dir, remote = remote, name = remote.Name,
-			class = cn, method = method, args = args, clock = nowStr(),
-		}
-		if dir ~= "in" then
-			local gcs = G("getcallingscript")
-			if gcs then
-				local ok, s = pcall(gcs)
-				if ok then e.script = s end
-			end
-			if Remote.cobalt and Remote.trace then
-				e.trace = debug.traceback("", 3)
-			end
-		end
-		e.blocked = Remote.blocked[remote] == true
-		push(function() dispatchRemote(e) end)
-		return e
-	end
-
-	local function installRemote()
-		if Remote.installed then return true end
-		local hookmm, getnc = G("hookmetamethod"), G("getnamecallmethod")
-		if not (hookmm and getnc) then
-			return false, "executor lacks hookmetamethod / getnamecallmethod"
-		end
-		local setnc = G("setnamecallmethod")
-		local newcc = G("newcclosure") or function(f) return f end
-		local checkcaller = G("checkcaller") or function() return false end
-
-		-- [SPIES:REMOTE-HOOK] called for EVERY FireServer / InvokeServer (namecall and direct form).
-		-- This is the place to add your own logic: filter/rewrite `...` before oldFn(self, ...),
-		-- change what gets recorded (recordRemote), or decide what is blocked (Remote.blocked).
-		local function handle(oldFn, isNC, self, method, ...)
-			if isNC and setnc then setnc(method) end
-			local co = coroutine.running()
-			if Remote.inCall[co] or checkcaller() then return oldFn(self, ...) end
-			local cn = classifyCall(self, method)
-			if not cn then
-				if isNC and setnc then setnc(method) end
-				return oldFn(self, ...)
-			end
-			local e = recordRemote("out", self, cn, method, pack(...))
-			if e.blocked then return nil end
-			Remote.inCall[co] = true
-			push(function() Remote.inCall[co] = nil end)
-			if isNC and setnc then setnc(method) end
-			local r = pack(oldFn(self, ...))
-			Remote.inCall[co] = nil
-			e.ret = r
-			return unpack(r, 1, r.n)
-		end
-
-		-- [SPIES:NAMECALL-HOOK] the single global __namecall hook used by UtopiaSpy + Cobalt tabs.
-		-- How it is installed (hookmetamethod, newcclosure wrapper) is decided here.
-		local oldNC
-		oldNC = hookmm(game, "__namecall", newcc(function(self, ...)
-			local method = getnc()
-			if (Remote.simple or Remote.cobalt) and type(method) == "string" and (OUT[method] or OUTB[method]) then
-				return handle(oldNC, true, self, method, ...)
-			end
-			return oldNC(self, ...)
-		end))
-
-		-- [SPIES:DIRECT-HOOK] direct calls: remote.FireServer(remote, ...)
-		local hookf = G("hookfunction")
-		if hookf then
-			local function hookDirect(className, method)
-				local ok, err = pcall(function()
-					local inst = Instance.new(className)
-					local f = inst[method]
-					inst:Destroy()
-					local old
-					old = hookf(f, newcc(function(self, ...)
-						if Remote.simple or Remote.cobalt then
-							return handle(old, false, self, method, ...)
-						end
-						return old(self, ...)
-					end))
-				end)
-				if not ok then warn("[BAD DEX Spies] direct hook " .. className .. "." .. method .. " failed: " .. tostring(err)) end
-			end
-			hookDirect("RemoteEvent", "FireServer")
-			hookDirect("RemoteFunction", "InvokeServer")
-			pcall(hookDirect, "UnreliableRemoteEvent", "FireServer")
-			pcall(hookDirect, "BindableEvent", "Fire")
-			pcall(hookDirect, "BindableFunction", "Invoke")
-		end
-
-		Remote.installed = true
-		startQueue()
-		return true
-	end
-
-	local function incomingWanted(r)
-		if not Remote.incoming then return false end
-		return (Remote.cobalt and not Remote.cobaltIgnored[r]) or (Remote.simple and not Remote.simpleIgnored[r]) or false
-	end
-
-	-- [SPIES:UTOPIA-CLIENTINVOKE] logs server -> client RemoteFunction calls (OnClientInvoke) like UtopiaSpy does.
-	-- Needs getcallbackmember + hookfunction; switch off with Spies.Utopia.invokeClientHook = false.
-	local function hookClientInvoke(rf)
-		local gcm, hookf = G("getcallbackmember"), G("hookfunction")
-		if not (Utopia.invokeClientHook and gcm and hookf) then return end
-		local newcc = G("newcclosure") or function(f) return f end
-		local function hookCb()
-			local ok, cb = pcall(gcm, rf, "OnClientInvoke")
-			if not ok or type(cb) ~= "function" or Remote.cbHooked[cb] then return end
-			local old
-			local ok2, res = pcall(hookf, cb, newcc(function(...)
-				if Remote.simple and Remote.incoming then
-					recordRemote("in", rf, rf.ClassName, "InvokeClient", pack(...))
-				end
-				return old(...)
-			end))
-			if ok2 then old = res Remote.cbHooked[cb] = true end
-		end
-		hookCb()
-		local okc, con = pcall(function() return rf:GetPropertyChangedSignal("OnClientInvoke"):Connect(hookCb) end)
-		if okc and con then table.insert(Remote.incomingCons, con) end
-	end
-
-	local function connectIncoming()
-		if Remote.incomingConnected then return end
-		Remote.incomingConnected = true
-		local function hookRemote(r)
-			local ok, con = pcall(function()
-				return r.OnClientEvent:Connect(function(...)
-					if incomingWanted(r) then
-						recordRemote("in", r, r.ClassName, "OnClientEvent", pack(...))
-					end
-				end)
-			end)
-			if ok and con then table.insert(Remote.incomingCons, con) end
-		end
-		for _, d in ipairs(game:GetDescendants()) do
-			if d:IsA("BaseRemoteEvent") then hookRemote(d)
-			elseif d.ClassName == "RemoteFunction" then pcall(hookClientInvoke, d) end
-		end
-		Remote.descCon = game.DescendantAdded:Connect(function(d)
-			if d:IsA("BaseRemoteEvent") then hookRemote(d)
-			elseif d.ClassName == "RemoteFunction" then pcall(hookClientInvoke, d) end
-		end)
-	end
-
-	local function disconnectIncoming()
-		for _, c in ipairs(Remote.incomingCons) do pcall(function() c:Disconnect() end) end
-		Remote.incomingCons = {}
-		if Remote.descCon then Remote.descCon:Disconnect() Remote.descCon = nil end
-		Remote.incomingConnected = false
-	end
-
-	local function replayRemote(e)
-		local r = e.remote
-		if e.dir == "in" then
-			local fs = G("firesignal")
-			if not fs then error("firesignal is not supported by your executor") end
-			fs(r.OnClientEvent, unpack(e.args, 1, e.args.n))
-		else
-			task.spawn(function()
-				local ok, err = pcall(function() return r[e.method](r, unpack(e.args, 1, e.args.n)) end)
-				if not ok then warn("[BAD DEX Spies] replay failed: " .. tostring(err)) end
-			end)
-		end
-	end
-
-	local function scriptPath(s)
-		if typeof(s) == "Instance" then return pathOf(s) end
-		return "nil"
-	end
-
-	local function remoteDetail(e, full, style)
-		local out = {}
-		out[#out + 1] = "-- Remote:  " .. pathOf(e.remote)
-		out[#out + 1] = "-- Class:   " .. e.class .. "   Method: " .. e.method .. "   Time: " .. e.clock
-		out[#out + 1] = "-- Calling script: " .. scriptPath(e.script)
-		if e.blocked then out[#out + 1] = "-- BLOCKED: this call never reached the server" end
-		if e.ret then
-			local rp = serializeArgs(e.ret)
-			out[#out + 1] = "-- Return (" .. e.ret.n .. "): " .. (table.concat(rp, ", "):gsub("\n", "\n--   "))
-		elseif e.method:lower() == "invokeserver" and not e.blocked then
-			out[#out + 1] = "-- Return: (still pending / errored)"
-		end
-		out[#out + 1] = ""
-		out[#out + 1] = (style == "utopia") and utopiaCode(e) or genRemoteCode(e)
-		if full and e.trace and e.trace ~= "" then
-			out[#out + 1] = ""
-			out[#out + 1] = "--[[ traceback"
-			out[#out + 1] = traceBlock(e.trace)
-			out[#out + 1] = "]]"
-		end
-		return table.concat(out, "\n")
-	end
-
-	local function remoteRowText(e)
-		local arrow = e.dir == "in" and "<- " or "-> "
-		return string.format("[%s] %s%s : %s", e.clock, arrow, e.name, e.method)
-	end
-
-	local function toggleText(label, on) return label .. ": " .. (on and "ON" or "OFF") end
-
-	local function buildRemotePanel(kind)
-		local isCobalt = kind == "cobalt"
-		local ignoredSet = isCobalt and Remote.cobaltIgnored or Remote.simpleIgnored
-		local flag = isCobalt and "cobalt" or "simple"
-		local gen = isCobalt and genRemoteCode or utopiaCode -- UtopiaSpy tab = UtopiaSpy code generator
-		local P
-
-		local function sel() return P.selected and P.selected.Data end
-		local function needSel()
-			local e = sel()
-			if not e then P.setDetail("-- select a call first") end
-			return e
-		end
-		local function copyOrShow(text)
-			if not copyText(text) then P.setDetail("-- executor has no setclipboard; copy the code from this box\n\n" .. text) end
-		end
-		-- all recorded calls (still in the list) of the same remote as `e`, oldest first
-		local function callsOf(e)
-			local list = {}
-			for _, row in ipairs(P.rows) do
-				if row.Data.remote == e.remote then list[#list + 1] = row.Data end
-			end
-			return list
-		end
-
-		local buttons = {}
-		local function add(text, width, fn, init) buttons[#buttons + 1] = {text, width, fn, init} end
-
-		add("Enable: OFF", 84, function(btn)
-			if not Remote[flag] then
-				local ok, err = installRemote()
-				if not ok then P.setDetail("-- cannot enable: " .. tostring(err)) return end
-				Remote[flag] = true
-				if Remote.incoming then connectIncoming() end
-			else
-				Remote[flag] = false
-				if not (Remote.cobalt or Remote.simple) then disconnectIncoming() end
-			end
-			btn.Text = toggleText("Enable", Remote[flag])
-		end, function(btn) btn.Text = toggleText("Enable", Remote[flag]) end)
-
-		add("Incoming: ON", 86, function(btn)
-			Remote.incoming = not Remote.incoming
-			if Remote.cobalt or Remote.simple then
-				if Remote.incoming then connectIncoming() else disconnectIncoming() end
-			end
-			btn.Text = toggleText("Incoming", Remote.incoming)
-		end, function(btn) btn.Text = toggleText("Incoming", Remote.incoming) end)
-		if isCobalt then
-			add("Bindables: OFF", 94, function(btn)
-				Remote.bindables = not Remote.bindables
-				btn.Text = toggleText("Bindables", Remote.bindables)
-			end, function(btn) btn.Text = toggleText("Bindables", Remote.bindables) end)
-			add("Trace: ON", 70, function(btn)
-				Remote.trace = not Remote.trace
-				btn.Text = toggleText("Trace", Remote.trace)
-			end, function(btn) btn.Text = toggleText("Trace", Remote.trace) end)
-		end
-
-		add("Copy Code", 70, function()
-			local e = needSel() if not e then return end
-			copyOrShow(gen(e))
-		end)
-		if not isCobalt then
-			-- UtopiaSpy per-remote copy buttons
-			add("Copy last x10", 94, function()
-				local e = needSel() if not e then return end
-				local calls, out = callsOf(e), {}
-				for i = math.max(1, #calls - 9), #calls do out[#out + 1] = gen(calls[i]) end
-				copyOrShow(table.concat(out, "\n\n"))
-			end)
-			add("Copy all", 70, function()
-				local e = needSel() if not e then return end
-				local out = {}
-				for _, c in ipairs(callsOf(e)) do out[#out + 1] = gen(c) end
-				copyOrShow(table.concat(out, "\n\n"))
-			end)
-			add("Get Return", 82, function()
-				local e = needSel() if not e then return end
-				if e.ret then
-					P.setDetail("-- Return values of this call (" .. e.ret.n .. "):\n" .. utopiaArgsTable(e.ret))
-				elseif e.method:lower() == "invokeserver" then
-					P.setDetail("-- no return value captured (call blocked, still pending, or it errored)")
-				else
-					P.setDetail("-- " .. e.method .. " has no return value")
-				end
-			end)
-		end
-		add(isCobalt and "Replay" or "Run", 56, function()
-			local e = needSel() if not e then return end
-			replayRemote(e)
-		end)
-		add("Copy Path", 70, function()
-			local e = needSel() if not e then return end
-			copyText(pathOf(e.remote))
-		end)
-		if isCobalt then
-			add("View Script", 76, function()
-				local e = needSel() if not e then return end
-				if typeof(e.script) == "Instance" and ScriptViewer then
-					ScriptViewer.ViewScript(e.script)
-				else
-					P.setDetail("-- no calling script recorded for this call")
-				end
-			end)
-		end
-		add("Ignore", 56, function()
-			local e = needSel() if not e then return end
-			ignoredSet[e.remote] = true
-			P.setDetail("-- ignoring " .. e.name .. " (use Reset to undo)")
-		end)
-		if not isCobalt then
-			-- UtopiaSpy blacklistedNames: hide every remote with this NAME (also remotes created later)
-			add("Ignore Name", 90, function()
-				local e = needSel() if not e then return end
-				if not table.find(Utopia.blacklistedNames, e.name) then table.insert(Utopia.blacklistedNames, e.name) end
-				P.setDetail("-- \"" .. e.name .. "\" added to blacklistedNames (use Reset to undo)")
-			end)
-		end
-		add("Block", 52, function(btn)
-			local e = needSel() if not e then return end
-			Remote.blocked[e.remote] = not Remote.blocked[e.remote] or nil
-			P.setDetail("-- " .. e.name .. (Remote.blocked[e.remote] and " is now BLOCKED (calls are dropped client-side)" or " is no longer blocked"))
-		end)
-		add("Reset", 52, function()
-			table.clear(ignoredSet)
-			table.clear(Remote.blocked)
-			if not isCobalt then table.clear(Utopia.blacklistedNames) end
-			P.setDetail("-- cleared ignored / blocked lists")
-		end)
-		add("Clear", 52, function() P.clear() end)
-
-		P = makePanel({
-			name = isCobalt and "Cobalt" or "UtopiaSpy",
-			buttons = buttons,
-			hint = (isCobalt and "-- Cobalt: outgoing + incoming remote traffic, return values, calling script, traceback.\n"
-				or "-- UtopiaSpy: outgoing FireServer / InvokeServer + incoming OnClientEvent / OnClientInvoke,\n-- UtopiaSpy-style code (Remote:FireServer(table.unpack({...})), function dumps, utf8.char names).\n")
-				.. "-- Press Enable, then do something in the game. Click a call to see the generated code.\n"
-				.. "-- Needs hookmetamethod + getnamecallmethod (hookfunction/getcallingscript/firesignal/getcallbackmember improve it).\n"
-				.. (isCobalt and "" or "-- Settings (blacklistedNames, maxTableDepth, newFunctionMethod, ...): search for [SPIES:UTOPIA] in the Spies module."),
-		})
-		if isCobalt then Spies.CobaltPanel = P else Spies.SimplePanel = P end
-		return P
-	end
-
-	dispatchRemote = function(e)
-		local function show(P, ignored, full, style)
-			if ignored[e.remote] then return end
-			if style == "utopia" and table.find(Utopia.blacklistedNames, e.name) then return end
-			local color = e.blocked and COL_BLOCK or (e.dir == "in" and COL_IN or COL_OUT)
-			P.addRow(remoteRowText(e), color, e, function(row) P.setDetail(remoteDetail(row.Data, full, style)) end)
-		end
-		if Remote.simple and Spies.SimplePanel and (e.dir ~= "in" or Remote.incoming) then show(Spies.SimplePanel, Remote.simpleIgnored, false, "utopia") end
-		if Remote.cobalt and Spies.CobaltPanel then show(Spies.CobaltPanel, Remote.cobaltIgnored, true) end
-	end
-
-	---------------------------------------------------------------------
-	-- Function inspection helpers (Hydroxide / Closure Spy)
-	---------------------------------------------------------------------
-	local function fnInfo(f)
-		local getinfo = (debug and debug.getinfo) or G("getinfo")
-		if getinfo then
-			local ok, i = pcall(getinfo, f)
-			if ok and type(i) == "table" then return i end
-		end
-		return {}
-	end
-
-	local function fnScript(f)
-		local ok, e = pcall(getfenv, f)
-		if ok and type(e) == "table" then
-			local ok2, s = pcall(rawget, e, "script")
-			if ok2 and typeof(s) == "Instance" then return s end
-		end
-		return nil
-	end
-
-	local function isCClosure(f)
-		local iscc = G("iscclosure")
-		if iscc then
-			local ok, r = pcall(iscc, f)
-			if ok then return r end
-		end
-		return false
-	end
-
-	local function isExecClosure(f)
-		local fn = G("isexecutorclosure") or G("checkclosure") or G("is_synapse_function") or G("is_executor_closure")
-		if fn then
-			local ok, r = pcall(fn, f)
-			if ok then return r end
-		end
-		return false
-	end
-
-	local function oneLine(v, cap)
-		local ok, s = pcall(serialize, v, 0, {}, 5)
-		if not ok then s = tostring(v) end
-		s = s:gsub("%s+", " ")
-		cap = cap or 120
-		if #s > cap then s = s:sub(1, cap) .. "..." end
-		return s
-	end
-
-	local function describeFn(f)
-		if type(f) ~= "function" then return tostring(f) end
-		local i = fnInfo(f)
-		local scr = fnScript(f)
-		return string.format("%s [%s:%s] %s%s",
-			(i.name and i.name ~= "") and i.name or "anonymous",
-			scr and scr.Name or tostring(i.short_src or i.source or "?"),
-			tostring(i.linedefined or i.currentline or "?"),
-			isCClosure(f) and "C closure" or "Lua closure",
-			isExecClosure(f) and ", executor" or "")
-	end
-
-	local function fnDetail(f)
-		local out = {}
-		local i = fnInfo(f)
-		local scr = fnScript(f)
-		out[#out + 1] = "-- Function: " .. ((i.name and i.name ~= "") and i.name or "anonymous")
-		out[#out + 1] = "-- Type:     " .. (isCClosure(f) and "C closure" or "Lua closure") .. (isExecClosure(f) and " (executor)" or "")
-		out[#out + 1] = "-- Script:   " .. (scr and pathOf(scr) or "unknown")
-		out[#out + 1] = "-- Source:   " .. tostring(i.source or i.short_src or "?") .. "   line " .. tostring(i.linedefined or "?")
-		out[#out + 1] = "-- Params:   " .. tostring(i.numparams or i.nparams or "?") .. "   vararg: " .. tostring(i.is_vararg or i.isvararg or "?")
-		local fnames = {
-			ups = G("getupvalues") or (debug and debug.getupvalues),
-			consts = G("getconstants") or (debug and debug.getconstants),
-			protos = G("getprotos") or (debug and debug.getprotos),
-		}
-		if fnames.ups then
-			local ok, ups = pcall(fnames.ups, f)
-			if ok and type(ups) == "table" then
-				local keys = {}
-				for k in pairs(ups) do keys[#keys + 1] = k end
-				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-				out[#out + 1] = ""
-				out[#out + 1] = "-- Upvalues (" .. #keys .. "):"
-				for n, k in ipairs(keys) do
-					if n > 80 then out[#out + 1] = "--   ..." break end
-					out[#out + 1] = "--   [" .. tostring(k) .. "] (" .. typeof(ups[k]) .. ") = " .. oneLine(ups[k])
-				end
-			end
-		end
-		if fnames.consts then
-			local ok, cs = pcall(fnames.consts, f)
-			if ok and type(cs) == "table" then
-				local keys = {}
-				for k in pairs(cs) do keys[#keys + 1] = k end
-				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-				out[#out + 1] = ""
-				out[#out + 1] = "-- Constants (" .. #keys .. "):"
-				for n, k in ipairs(keys) do
-					if n > 120 then out[#out + 1] = "--   ..." break end
-					out[#out + 1] = "--   [" .. tostring(k) .. "] " .. oneLine(cs[k], 100)
-				end
-			end
-		end
-		if fnames.protos then
-			local ok, ps = pcall(fnames.protos, f)
-			if ok and type(ps) == "table" then
-				out[#out + 1] = ""
-				out[#out + 1] = "-- Protos: " .. #ps
-				for n, p in ipairs(ps) do
-					if n > 40 then break end
-					if type(p) == "function" then out[#out + 1] = "--   " .. describeFn(p) end
-				end
-			end
-		end
-		return table.concat(out, "\n")
-	end
-
-	local function compileExpr(src)
-		local ls = G("loadstring") or loadstring
-		if not ls then return nil, "loadstring not available" end
-		local fn, err = ls("return " .. src)
-		if not fn then return nil, err end
-		return fn
-	end
-
-	---------------------------------------------------------------------
-	-- Closure Spy
-	---------------------------------------------------------------------
-	local Closure = {hooked = {}, list = {}}
-	local dispatchClosure
-
-	local function hookClosure(f, label)
-		if type(f) ~= "function" then return false, "not a function" end
-		if Closure.hooked[f] then return false, "already hooked" end
-		local hookf = G("hookfunction")
-		if not hookf then return false, "executor lacks hookfunction" end
-		local newcc = G("newcclosure") or function(x) return x end
-		local checkcaller = G("checkcaller") or function() return false end
-		local rec = {fn = f, label = label or fnName(f), active = true, block = false, calls = 0}
-		local old
-		-- [SPIES:CLOSURE-HOOK] wrapper that replaces every hooked closure; logging + blocking happen here
-		local function wrapper(...)
-			if rec.active and not checkcaller() then
-				rec.calls = rec.calls + 1
-				local e = {rec = rec, args = pack(...), clock = nowStr(), trace = debug.traceback("", 2)}
-				push(function() dispatchClosure(e) end)
-				if rec.block then return end
-				local r = pack(old(...))
-				e.ret = r
-				return unpack(r, 1, r.n)
-			end
-			return old(...)
-		end
-		local wrapped = wrapper
-		if isCClosure(f) then wrapped = newcc(wrapper) end
-		local ok, res = pcall(hookf, f, wrapped)
-		if not ok then return false, tostring(res) end
-		old = res
-		Closure.hooked[f] = rec
-		Closure.list[#Closure.list + 1] = rec
-		startQueue()
-		return true, rec
-	end
-
-	local function unhookClosure(rec)
-		rec.active = false
-		local rf = G("restorefunction")
-		if rf then pcall(rf, rec.fn) end
-		Closure.hooked[rec.fn] = nil
-	end
-
-	local function gcFunctions()
-		local getgc = G("getgc")
-		if not getgc then return nil, "executor lacks getgc" end
-		local ok, list = pcall(getgc, true)
-		if not ok or type(list) ~= "table" then
-			ok, list = pcall(getgc)
-		end
-		if not ok then return nil, tostring(list) end
-		return list
-	end
-
-	local function buildClosurePanel()
-		local P
-		local function needRec()
-			local row = P.selected
-			if not row or not row.Data then P.setDetail("-- select a logged call first") return nil end
-			return row.Data.rec, row.Data
-		end
-		local buttons = {
-			{"Hook by name", 90, function()
-				local name = P.boxes.name.Text
-				if name == "" then P.setDetail("-- type a function name into the box first") return end
-				local list, err = gcFunctions()
-				if not list then P.setDetail("-- " .. tostring(err)) return end
-				local n = 0
-				for _, f in ipairs(list) do
-					if type(f) == "function" and not isCClosure(f) and not isExecClosure(f) then
-						local nm = fnInfo(f).name
-						if nm == name then
-							local ok = hookClosure(f, name)
-							if ok then n = n + 1 end
-							if n >= 25 then break end
-						end
-					end
-				end
-				P.setDetail("-- hooked " .. n .. " closure(s) named '" .. name .. "'. Trigger them in-game and calls will show here.")
-			end},
-			{"Hooked list", 76, function()
-				local out = {"-- Hooked closures:"}
-				for i, rec in ipairs(Closure.list) do
-					out[#out + 1] = string.format("-- %d. %s  calls=%d  %s%s", i, rec.label, rec.calls, rec.active and "active" or "unhooked", rec.block and "  BLOCKING" or "")
-				end
-				P.setDetail(table.concat(out, "\n"))
-			end},
-			{"Block", 52, function()
-				local rec = needRec() if not rec then return end
-				rec.block = not rec.block
-				P.setDetail("-- " .. rec.label .. (rec.block and " now BLOCKED (original is not called)" or " no longer blocked"))
-			end},
-			{"Unhook", 60, function()
-				local rec = needRec() if not rec then return end
-				unhookClosure(rec)
-				P.setDetail("-- unhooked " .. rec.label)
-			end},
-			{"Unhook All", 74, function()
-				for _, rec in ipairs(Closure.list) do unhookClosure(rec) end
-				P.setDetail("-- all closures unhooked")
-			end},
-			{"Copy Args", 70, function()
-				local _, e = needRec() if not e then return end
-				local parts = serializeArgs(e.args)
-				copyText("-- " .. e.rec.label .. " args\nreturn " .. table.concat(parts, ", "))
-			end},
-			{"Clear", 52, function() P.clear() end},
-		}
-		P = makePanel({
-			name = "ClosureSpy",
-			buttons = buttons,
-			boxes = {{"function name to hook", 150, "name"}},
-			hint = "-- Closure Spy: logs calls (args, returns, traceback) of hooked Lua closures.\n"
-				.. "-- Hook a function by name (getgc scan), or use Hydroxide -> pick a function -> 'Spy Closure'.\n"
-				.. "-- Needs hookfunction (+ getgc for name search).",
-		})
-		Spies.ClosurePanel = P
-		return P
-	end
-
-	dispatchClosure = function(e)
-		local P = Spies.ClosurePanel
-		if not P then return end
-		local previews = {}
-		for i = 1, math.min(e.args.n, 4) do previews[i] = oneLine(e.args[i], 24) end
-		local text = string.format("[%s] %s(%s%s)", e.clock, e.rec.label, table.concat(previews, ", "), e.args.n > 4 and ", ..." or "")
-		P.addRow(text, e.rec.block and COL_BLOCK or COL_OUT, e, function(row)
-			local d = row.Data
-			local out = {}
-			out[#out + 1] = "-- Closure: " .. d.rec.label .. "   total calls: " .. d.rec.calls .. (d.rec.block and "   [BLOCKING]" or "")
-			out[#out + 1] = "-- Time: " .. d.clock
-			out[#out + 1] = ""
-			out[#out + 1] = "-- Arguments (" .. d.args.n .. "):"
-			local ps = serializeArgs(d.args)
-			for i = 1, d.args.n do out[#out + 1] = "local arg" .. i .. " = " .. ps[i] end
-			if d.ret then
-				out[#out + 1] = ""
-				out[#out + 1] = "-- Returned (" .. d.ret.n .. "):"
-				local rs = serializeArgs(d.ret)
-				for i = 1, d.ret.n do out[#out + 1] = "local ret" .. i .. " = " .. rs[i] end
-			elseif d.rec.block then
-				out[#out + 1] = ""
-				out[#out + 1] = "-- (call was blocked, nothing returned)"
-			end
-			if d.trace then
-				out[#out + 1] = ""
-				out[#out + 1] = "--[[ traceback"
-				out[#out + 1] = traceBlock(d.trace)
-				out[#out + 1] = "]]"
-			end
-			P.setDetail(table.concat(out, "\n"))
-		end)
-	end
-
-	---------------------------------------------------------------------
-	-- Hydroxide (scanner: functions / scripts / modules / remotes)
-	---------------------------------------------------------------------
-	local Hydro = {mode = 1, scanning = false}
-	local HYDRO_MODES = {"Functions", "Scripts", "Modules", "Remotes"}
-
-	local function matchesFilter(fl, ...)
-		if fl == "" then return true end
-		for i = 1, select("#", ...) do
-			local s = select(i, ...)
-			if type(s) == "string" and s:lower():find(fl, 1, true) then return true end
-		end
-		return false
-	end
-
-	local function fnMatches(f, fl, info, scr)
-		if fl == "" then return true end
-		if matchesFilter(fl, info.name or "", tostring(info.short_src or info.source or ""), scr and pathOf(scr) or "") then return true end
-		local gcn, gup = G("getconstants") or (debug and debug.getconstants), G("getupvalues") or (debug and debug.getupvalues)
-		if gcn then
-			local ok, cs = pcall(gcn, f)
-			if ok and type(cs) == "table" then
-				for _, c in pairs(cs) do
-					if type(c) == "string" and c:lower():find(fl, 1, true) then return true end
-				end
-			end
-		end
-		if gup then
-			local ok, us = pcall(gup, f)
-			if ok and type(us) == "table" then
-				for _, u in pairs(us) do
-					if type(u) == "string" and u:lower():find(fl, 1, true) then return true end
-				end
-			end
-		end
-		return false
-	end
-
-	local function scriptDetail(inst)
-		local out = {}
-		out[#out + 1] = "-- Script:  " .. pathOf(inst)
-		out[#out + 1] = "-- Class:   " .. inst.ClassName
-		pcall(function()
-			if inst:IsA("BaseScript") then
-				out[#out + 1] = "-- Enabled: " .. tostring(inst.Enabled) .. "   RunContext: " .. tostring(inst.RunContext)
-			end
-		end)
-		local gse = G("getsenv")
-		if gse and inst.ClassName ~= "Script" then
-			local ok, senv = pcall(gse, inst)
-			if ok and type(senv) == "table" then
-				local keys = {}
-				for k in pairs(senv) do keys[#keys + 1] = k end
-				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-				out[#out + 1] = ""
-				out[#out + 1] = "-- Script environment (getsenv) - " .. #keys .. " entries:"
-				for n, k in ipairs(keys) do
-					if n > 150 then out[#out + 1] = "--   ..." break end
-					local v = senv[k]
-					if type(v) == "function" then
-						out[#out + 1] = "--   " .. tostring(k) .. " = " .. describeFn(v)
-					else
-						out[#out + 1] = "--   " .. tostring(k) .. " (" .. typeof(v) .. ") = " .. oneLine(v)
-					end
-				end
-			else
-				out[#out + 1] = ""
-				out[#out + 1] = "-- getsenv failed (script not running / not supported)"
-			end
-		end
-		return table.concat(out, "\n")
-	end
-
-	local function remoteHandlers(r)
-		local list = {}
-		local gcon = G("getconnections")
-		if gcon and (r:IsA("BaseRemoteEvent")) then
-			local ok, cons = pcall(gcon, r.OnClientEvent)
-			if ok and type(cons) == "table" then
-				for _, c in ipairs(cons) do
-					local okf, f = pcall(function() return c.Function end)
-					list[#list + 1] = {con = c, fn = okf and type(f) == "function" and f or nil}
-				end
-			end
-		elseif r:IsA("RemoteFunction") then
-			local gcb = G("getcallbackvalue")
-			if gcb then
-				local ok, f = pcall(gcb, r, "OnClientInvoke")
-				if ok and type(f) == "function" then list[#list + 1] = {fn = f} end
-			end
-		end
-		return list
-	end
-
-	local function remoteDetailHydro(r)
-		local out = {}
-		out[#out + 1] = "-- Remote: " .. pathOf(r)
-		out[#out + 1] = "-- Class:  " .. r.ClassName
-		local hs = remoteHandlers(r)
-		out[#out + 1] = ""
-		out[#out + 1] = "-- Client handlers (" .. #hs .. "):"
-		for i, h in ipairs(hs) do
-			local enabled = ""
-			if h.con then
-				local ok, en = pcall(function() return h.con.Enabled end)
-				if ok then enabled = "  enabled=" .. tostring(en) end
-			end
-			out[#out + 1] = "--   " .. i .. ". " .. (h.fn and describeFn(h.fn) or "(no Lua function / C connection)") .. enabled
-		end
-		out[#out + 1] = ""
-		out[#out + 1] = "local remote = " .. pathOf(r)
-		if r:IsA("RemoteFunction") then
-			out[#out + 1] = "-- remote:InvokeServer(...)"
-		elseif r:IsA("BaseRemoteEvent") then
-			out[#out + 1] = "-- remote:FireServer(...)"
-		end
-		return table.concat(out, "\n")
-	end
-
-	local function moduleDetail(m)
-		local out = {}
-		out[#out + 1] = "-- ModuleScript: " .. pathOf(m)
-		local ok, res = pcall(require, m)
-		out[#out + 1] = ""
-		if not ok then
-			out[#out + 1] = "-- require failed: " .. tostring(res)
-		else
-			out[#out + 1] = "-- require() returned (" .. typeof(res) .. "):"
-			local okS, s = pcall(serialize, res, 0, {}, 0)
-			out[#out + 1] = "local module = " .. (okS and s or tostring(res))
-		end
-		return table.concat(out, "\n")
-	end
-
-	-- [SPIES:HYDROXIDE] scanner tab: scan() has one branch per mode (Functions/Scripts/Modules/Remotes)
-	local function buildHydroPanel()
-		local P
-
-		local function scan()
-			if Hydro.scanning then P.setDetail("-- scan already running") return end
-			Hydro.scanning = true
-			P.clear()
-			local mode = Hydro.mode
-			local fl = P.boxes.filter.Text:lower()
-			task.spawn(function()
-				local ok, err = pcall(function()
-					local count = 0
-					local CAP = 400
-					if mode == 1 then
-						local list, e = gcFunctions()
-						if not list then error(e, 0) end
-						for idx, f in ipairs(list) do
-							if idx % 1500 == 0 then task.wait() end
-							if type(f) == "function" and not isCClosure(f) and not isExecClosure(f) then
-								local info = fnInfo(f)
-								local scr = fnScript(f)
-								if (fl ~= "" or (info.name and info.name ~= "")) and fnMatches(f, fl, info, scr) then
-									local nm = (info.name and info.name ~= "") and info.name or "anonymous"
-									P.addRow(string.format("%s  [%s:%s]", nm, scr and scr.Name or tostring(info.short_src or "?"), tostring(info.linedefined or "?")),
-										nil, {kind = "fn", fn = f}, function(row) P.setDetail(fnDetail(row.Data.fn)) end)
-									count = count + 1
-									if count >= CAP then break end
-								end
-							end
-						end
-					elseif mode == 2 then
-						local gs = G("getscripts")
-						local list
-						if gs then
-							local ok2, r = pcall(gs)
-							if ok2 then list = r end
-						end
-						if not list then
-							list = {}
-							for _, d in ipairs(game:GetDescendants()) do
-								if d:IsA("LuaSourceContainer") then list[#list + 1] = d end
-							end
-						end
-						for idx, s in ipairs(list) do
-							if idx % 800 == 0 then task.wait() end
-							if typeof(s) == "Instance" and matchesFilter(fl, s.Name, pathOf(s), s.ClassName) then
-								P.addRow("[" .. s.ClassName .. "] " .. s.Name, nil, {kind = "script", inst = s},
-									function(row) P.setDetail(scriptDetail(row.Data.inst)) end)
-								count = count + 1
-								if count >= CAP then break end
-							end
-						end
-					elseif mode == 3 then
-						local glm = G("getloadedmodules")
-						local list
-						if glm then
-							local ok2, r = pcall(glm)
-							if ok2 then list = r end
-						end
-						if not list then
-							list = {}
-							for _, d in ipairs(game:GetDescendants()) do
-								if d:IsA("ModuleScript") then list[#list + 1] = d end
-							end
-						end
-						for idx, m in ipairs(list) do
-							if idx % 800 == 0 then task.wait() end
-							if typeof(m) == "Instance" and matchesFilter(fl, m.Name, pathOf(m)) then
-								P.addRow(m.Name, nil, {kind = "module", inst = m}, function(row) P.setDetail(moduleDetail(row.Data.inst)) end)
-								count = count + 1
-								if count >= CAP then break end
-							end
-						end
-					else
-						local list = {}
-						for _, d in ipairs(game:GetDescendants()) do
-							if d:IsA("BaseRemoteEvent") or d:IsA("RemoteFunction") then list[#list + 1] = d end
-						end
-						local gni = G("getnilinstances")
-						if gni then
-							local ok2, nils = pcall(gni)
-							if ok2 and type(nils) == "table" then
-								for _, d in ipairs(nils) do
-									if typeof(d) == "Instance" and (d:IsA("BaseRemoteEvent") or d:IsA("RemoteFunction")) then list[#list + 1] = d end
-								end
-							end
-						end
-						for idx, r in ipairs(list) do
-							if idx % 800 == 0 then task.wait() end
-							if matchesFilter(fl, r.Name, pathOf(r)) then
-								P.addRow("[" .. r.ClassName .. "] " .. r.Name, nil, {kind = "remote", inst = r},
-									function(row) P.setDetail(remoteDetailHydro(row.Data.inst)) end)
-								count = count + 1
-								if count >= CAP then break end
-							end
-						end
-					end
-					P.setDetail("-- " .. HYDRO_MODES[mode] .. " scan finished: " .. count .. " result(s)" .. (count >= CAP and " (capped)" or ""))
-				end)
-				Hydro.scanning = false
-				if not ok then P.setDetail("-- scan failed: " .. tostring(err)) end
-			end)
-		end
-
-		local function needData(kind)
-			local row = P.selected
-			if not row or not row.Data then P.setDetail("-- select a result first") return nil end
-			if kind and row.Data.kind ~= kind then P.setDetail("-- this action only works on " .. kind .. " results") return nil end
-			return row.Data
-		end
-
-		local buttons = {
-			{"Mode: Functions", 110, function(btn)
-				Hydro.mode = Hydro.mode % #HYDRO_MODES + 1
-				btn.Text = "Mode: " .. HYDRO_MODES[Hydro.mode]
-			end},
-			{"Scan", 52, scan},
-			{"Spy Closure", 84, function()
-				local d = needData() if not d then return end
-				local f = d.fn
-				if d.kind == "remote" then
-					local hs = remoteHandlers(d.inst)
-					f = hs[1] and hs[1].fn
-				end
-				if not f then P.setDetail("-- no Lua function available for this result") return end
-				local ok, res = hookClosure(f, fnName(f))
-				if ok then
-					P.setDetail("-- hooked " .. describeFn(f) .. "\n-- open the Closure Spy tab to watch its calls.")
-				else
-					P.setDetail("-- could not hook: " .. tostring(res))
-				end
-			end},
-			{"View Script", 80, function()
-				local d = needData() if not d then return end
-				local s = d.inst
-				if d.kind == "fn" then s = fnScript(d.fn) end
-				if typeof(s) == "Instance" and ScriptViewer then ScriptViewer.ViewScript(s)
-				else P.setDetail("-- no script available for this result") end
-			end},
-			{"Set Upvalue", 84, function()
-				local d = needData("fn") if not d then return end
-				local idx, expr = P.boxes.edit.Text:match("^%s*(%d+)%s*=%s*(.+)$")
-				if not idx then P.setDetail("-- type  <index> = <lua expr>  in the right box, e.g.  2 = 9999") return end
-				local sup = G("setupvalue") or (debug and debug.setupvalue)
-				if not sup then P.setDetail("-- executor lacks setupvalue") return end
-				local fn, err = compileExpr(expr)
-				if not fn then P.setDetail("-- bad expression: " .. tostring(err)) return end
-				local ok, v = pcall(fn)
-				if not ok then P.setDetail("-- expression error: " .. tostring(v)) return end
-				local ok2, e2 = pcall(sup, d.fn, tonumber(idx), v)
-				P.setDetail(ok2 and fnDetail(d.fn) or ("-- setupvalue failed: " .. tostring(e2)))
-			end},
-			{"Call", 46, function()
-				local d = needData("fn") if not d then return end
-				local fn, err = compileExpr("table.pack(" .. P.boxes.edit.Text .. ")")
-				if not fn then P.setDetail("-- bad arguments: " .. tostring(err)) return end
-				local ok, packed = pcall(fn)
-				if not ok then P.setDetail("-- argument error: " .. tostring(packed)) return end
-				local res = pack(pcall(d.fn, unpack(packed, 1, packed.n)))
-				local lines = {fnDetail(d.fn), "", "-- Call result: " .. (res[1] and "ok" or "ERROR")}
-				for i = 2, res.n do lines[#lines + 1] = "-- [" .. (i - 1) .. "] " .. oneLine(res[i], 300) end
-				P.setDetail(table.concat(lines, "\n"))
-			end},
-			{"Copy Info", 70, function() copyText(P.Detail.Text) end},
-			{"Clear", 52, function() P.clear() end},
-		}
-		P = makePanel({
-			name = "Hydroxide",
-			buttons = buttons,
-			boxes = {{"filter (name / path / string constant)", 200, "filter"}, {"edit: '2 = 123'  or  call args", 170, "edit"}},
-			hint = "-- Hydroxide: scan the game's memory.\n"
-				.. "--   Functions: getgc scan (filter also matches string constants + upvalues)\n"
-				.. "--   Scripts / Modules: getscripts / getloadedmodules + getsenv / require\n"
-				.. "--   Remotes: client handlers (getconnections) for every RemoteEvent / Function\n"
-				.. "-- Change the mode, optionally type a filter, press Scan.\n"
-				.. "-- Needs getgc / getconstants / getupvalues / getsenv / getconnections (varies per executor).",
-		})
-		Spies.HydroPanel = P
-		return P
-	end
-
-	-- [SPIES:UTOPIA-SRC] full UtopiaSpy script (Made by UtopiaTM), embedded unchanged; run by the Originals tab.
-	local UTOPIA_SRC = [==[
+-- UtopiaSpy source (embedded; the Originals tab runs it with loadstring, nothing is downloaded)
+local UTOPIA_SRC = [==[
 -- Деобфусцировано из MoonSec V3: VM снята -> Lua 5.1 байткод -> unluac-rs
 -- Поведение лифтнутого байткода сверено с оригиналом в песочнице (одинаковые вызовы API).
 -- Имена локальных переменных в VM не хранятся, поэтому они вида rN_M / pN_M.
@@ -16713,6 +13903,1386 @@ r0_33 = print
 r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 ]==]
 
+local function main()
+	local Spies = {}
+	local window, tabBar, body
+	local tabs = {}
+	local currentTab
+
+	local RunService = game:GetService("RunService")
+	local ge = (getgenv and getgenv()) or _G
+
+	---------------------------------------------------------------------
+	-- Helpers
+	---------------------------------------------------------------------
+	-- snapshot the hook functions before Hook Spy can wrap them (our own calls must never be logged)
+	local ORIG = {}
+	for _, n in ipairs({"hookfunction", "hookmetamethod", "replaceclosure", "setrawmetatable", "setreadonly", "make_writeable", "restorefunction"}) do
+		ORIG[n] = (env and env[n]) or ge[n]
+	end
+
+	local function G(name)
+		if ORIG[name] ~= nil then return ORIG[name] end
+		local v = env and env[name]
+		if v ~= nil then return v end
+		v = ge[name]
+		if v ~= nil then return v end
+		return nil
+	end
+
+	local function theme(name, fallback)
+		local ok, v = pcall(function() return Settings.Theme[name] end)
+		if ok and v then return v end
+		return fallback
+	end
+
+	local function copyText(text)
+		local f = G("setclipboard") or G("toclipboard") or G("set_clipboard")
+		if f then pcall(f, text) return true end
+		return false
+	end
+
+	local function nowStr() return os.date("%X") end
+	local function pack(...) return {n = select("#", ...), ...} end
+	local unpack = table.unpack or unpack
+
+	local function safeComment(s)
+		return (tostring(s):gsub("%]%]", "] ]"):gsub("[\r\n]+", " "))
+	end
+
+	local function traceBlock(t)
+		return (tostring(t):gsub("%]%]", "] ]"):gsub("\t", "  "))
+	end
+
+	local keywords = {}
+	for w in ("and break do else elseif end false for function if in local nil not or repeat return then true until while continue"):gmatch("%a+") do
+		keywords[w] = true
+	end
+
+	local function validIdent(s)
+		return type(s) == "string" and s:match("^[%a_][%w_]*$") ~= nil and not keywords[s]
+	end
+
+	local function esc(s)
+		local r = s:gsub('[%c"\\]', function(c)
+			if c == '"' then return '\\"'
+			elseif c == "\\" then return "\\\\"
+			elseif c == "\n" then return "\\n"
+			elseif c == "\r" then return "\\r"
+			elseif c == "\t" then return "\\t" end
+			return string.format("\\%03d", c:byte())
+		end)
+		return '"' .. r .. '"'
+	end
+
+	local function nameKey(name)
+		if validIdent(name) then return "." .. name end
+		return "[" .. esc(name) .. "]"
+	end
+
+	local function isService(inst)
+		local ok, res = pcall(function() return game:GetService(inst.ClassName) == inst end)
+		return ok and res
+	end
+
+	local function pathOf(inst)
+		if inst == nil then return "nil" end
+		if inst == game then return "game" end
+		local chain = {}
+		local cur = inst
+		local guard = 0
+		while cur and cur ~= game and guard < 100 do
+			table.insert(chain, 1, cur)
+			cur = cur.Parent
+			guard = guard + 1
+		end
+		if cur ~= game then
+			return "nil --[[ nil-parented: " .. safeComment(inst.Name) .. " (" .. inst.ClassName .. ") ]]"
+		end
+		local out
+		local startIdx = 1
+		local lp = plr
+		if lp and chain[1] == game:GetService("Players") and chain[2] == lp then
+			out = 'game:GetService("Players").LocalPlayer'
+			startIdx = 3
+		elseif isService(chain[1]) then
+			out = 'game:GetService(' .. esc(chain[1].ClassName) .. ')'
+			startIdx = 2
+		else
+			out = "game" .. nameKey(chain[1].Name)
+			startIdx = 2
+		end
+		for i = startIdx, #chain do
+			out = out .. nameKey(chain[i].Name)
+		end
+		return out
+	end
+
+	-- [SPIES:SERIALIZE] value -> Lua source text (Vector3, CFrame, Instances, tables, ...). Add new types in serialize().
+	local serialize
+	local function serializeTable(t, indent, seen, depth)
+		if seen[t] then return "{} --[[ cyclic ]]" end
+		if depth > 6 then return "{} --[[ max depth ]]" end
+		seen[t] = true
+		local out = {}
+		local pad = string.rep("\t", indent + 1)
+		local okn, n = pcall(function() return #t end)
+		if not okn then n = 0 end
+		local limit = 150
+		for i = 1, n do
+			if #out >= limit then out[#out + 1] = pad .. "-- ... truncated" break end
+			out[#out + 1] = pad .. serialize(rawget(t, i), indent + 1, seen, depth + 1)
+		end
+		local okp = pcall(function()
+			for k, v in next, t do
+				if #out >= limit then out[#out + 1] = pad .. "-- ... truncated" break end
+				if not (type(k) == "number" and k >= 1 and k <= n and k % 1 == 0) then
+					local ks
+					if validIdent(k) then ks = k
+					else ks = "[" .. serialize(k, indent + 1, seen, depth + 1) .. "]" end
+					out[#out + 1] = pad .. ks .. " = " .. serialize(v, indent + 1, seen, depth + 1)
+				end
+			end
+		end)
+		seen[t] = nil
+		if #out == 0 then return "{}" end
+		return "{\n" .. table.concat(out, ",\n") .. "\n" .. string.rep("\t", indent) .. "}"
+	end
+
+	local function fnName(f)
+		local getinfo = (debug and debug.getinfo) or G("getinfo")
+		local nm = "unknown"
+		if getinfo then
+			local ok, info = pcall(getinfo, f)
+			if ok and info then
+				nm = (info.name and info.name ~= "" and info.name) or nm
+			end
+		end
+		return nm
+	end
+
+	serialize = function(v, indent, seen, depth)
+		indent = indent or 0
+		seen = seen or {}
+		depth = depth or 0
+		local tv = typeof(v)
+		if tv == "string" then
+			return esc(v)
+		elseif tv == "number" then
+			if v ~= v then return "0/0 --[[ nan ]]"
+			elseif v == math.huge then return "math.huge"
+			elseif v == -math.huge then return "-math.huge"
+			elseif v % 1 == 0 and math.abs(v) < 1e15 then return string.format("%d", v) end
+			return string.format("%.14g", v)
+		elseif tv == "boolean" or tv == "nil" then
+			return tostring(v)
+		elseif tv == "table" then
+			return serializeTable(v, indent, seen, depth)
+		elseif tv == "Instance" then
+			return pathOf(v)
+		elseif tv == "function" then
+			return "function() end --[[ " .. safeComment(fnName(v)) .. " ]]"
+		elseif tv == "Vector3" then
+			return string.format("Vector3.new(%s, %s, %s)", serialize(v.X), serialize(v.Y), serialize(v.Z))
+		elseif tv == "Vector2" then
+			return string.format("Vector2.new(%s, %s)", serialize(v.X), serialize(v.Y))
+		elseif tv == "CFrame" then
+			local comps = {v:GetComponents()}
+			for i = 1, #comps do comps[i] = serialize(comps[i]) end
+			return "CFrame.new(" .. table.concat(comps, ", ") .. ")"
+		elseif tv == "Color3" then
+			return string.format("Color3.new(%s, %s, %s)", serialize(v.R), serialize(v.G), serialize(v.B))
+		elseif tv == "UDim2" then
+			return string.format("UDim2.new(%s, %s, %s, %s)", serialize(v.X.Scale), serialize(v.X.Offset), serialize(v.Y.Scale), serialize(v.Y.Offset))
+		elseif tv == "UDim" then
+			return string.format("UDim.new(%s, %s)", serialize(v.Scale), serialize(v.Offset))
+		elseif tv == "EnumItem" or tv == "Enum" then
+			return tostring(v)
+		elseif tv == "BrickColor" then
+			return "BrickColor.new(" .. esc(v.Name) .. ")"
+		elseif tv == "NumberRange" then
+			return string.format("NumberRange.new(%s, %s)", serialize(v.Min), serialize(v.Max))
+		elseif tv == "Rect" then
+			return string.format("Rect.new(%s, %s, %s, %s)", serialize(v.Min.X), serialize(v.Min.Y), serialize(v.Max.X), serialize(v.Max.Y))
+		elseif tv == "Ray" then
+			return string.format("Ray.new(%s, %s)", serialize(v.Origin), serialize(v.Direction))
+		elseif tv == "TweenInfo" then
+			return string.format("TweenInfo.new(%s, %s, %s)", serialize(v.Time), tostring(v.EasingStyle), tostring(v.EasingDirection))
+		end
+		return "nil --[[ " .. safeComment(tv) .. ": " .. safeComment(tostring(v)) .. " ]]"
+	end
+
+	local function serializeArgs(args)
+		local parts = {}
+		for i = 1, args.n do
+			local ok, s = pcall(serialize, args[i], 0, {}, 0)
+			parts[i] = ok and s or ("nil --[[ serialize error: " .. safeComment(s) .. " ]]")
+		end
+		return parts
+	end
+
+	-- [SPIES:CODEGEN] turns a captured remote call into a runnable snippet (shown in Utopia/Cobalt details)
+	-- Generates a runnable snippet for a remote call
+	local function genRemoteCode(e)
+		local lines = {}
+		local dirText = e.dir == "in" and "Server -> Client" or "Client -> Server"
+		lines[#lines + 1] = "-- " .. dirText .. " | " .. safeComment(e.class) .. " | " .. e.clock
+		lines[#lines + 1] = "local remote = " .. pathOf(e.remote)
+		local exprs = serializeArgs(e.args)
+		local callArgs = {}
+		for i = 1, e.args.n do
+			if exprs[i]:find("\n", 1, true) or #exprs[i] > 90 then
+				lines[#lines + 1] = "local arg" .. i .. " = " .. exprs[i]
+				callArgs[i] = "arg" .. i
+			else
+				callArgs[i] = exprs[i]
+			end
+		end
+		local argStr = table.concat(callArgs, ", ")
+		if e.dir == "in" then
+			lines[#lines + 1] = ""
+			lines[#lines + 1] = "-- replay the incoming call on the client (needs firesignal):"
+			lines[#lines + 1] = "firesignal(remote.OnClientEvent" .. (argStr ~= "" and (", " .. argStr) or "") .. ")"
+		else
+			lines[#lines + 1] = ""
+			lines[#lines + 1] = "remote:" .. e.method .. "(" .. argStr .. ")"
+		end
+		return table.concat(lines, "\n")
+	end
+
+	---------------------------------------------------------------------
+	-- UI building blocks
+	---------------------------------------------------------------------
+	local C = {
+		Main1 = function() return theme("Main1", Color3.fromRGB(37, 37, 37)) end,
+		Main2 = function() return theme("Main2", Color3.fromRGB(46, 46, 46)) end,
+		Text = function() return theme("Text", Color3.fromRGB(230, 230, 230)) end,
+		Button = function() return theme("Button", Color3.fromRGB(60, 60, 60)) end,
+		Hover = function() return theme("ButtonHover", Color3.fromRGB(80, 80, 80)) end,
+		Sel = function() return theme("ListSelection", Color3.fromRGB(11, 90, 175)) end,
+	}
+	local COL_OUT = Color3.fromRGB(130, 190, 255)
+	local COL_IN = Color3.fromRGB(140, 230, 150)
+	local COL_BLOCK = Color3.fromRGB(240, 110, 110)
+	local COL_WARN = Color3.fromRGB(240, 200, 110)
+
+	local function mkButton(parent, text, width, onClick)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(0, width, 0, 20)
+		b.BackgroundColor3 = C.Button()
+		b.BorderSizePixel = 0
+		b.TextColor3 = C.Text()
+		b.Font = Enum.Font.SourceSans
+		b.TextSize = 14
+		b.AutoButtonColor = true
+		b.Text = text
+		b.Parent = parent
+		b.MouseButton1Click:Connect(function()
+			local ok, err = pcall(onClick, b)
+			if not ok then warn("[BAD DEX Spies] " .. tostring(err)) end
+		end)
+		return b
+	end
+
+	local function mkBox(parent, placeholder, width)
+		local t = Instance.new("TextBox")
+		t.Size = UDim2.new(0, width, 0, 20)
+		t.BackgroundColor3 = theme("TextBox", Color3.fromRGB(25, 25, 25))
+		t.BorderSizePixel = 0
+		t.TextColor3 = C.Text()
+		t.PlaceholderText = placeholder
+		t.PlaceholderColor3 = theme("PlaceholderText", Color3.fromRGB(120, 120, 120))
+		t.Font = Enum.Font.SourceSans
+		t.TextSize = 14
+		t.Text = ""
+		t.ClearTextOnFocus = false
+		t.TextXAlignment = Enum.TextXAlignment.Left
+		t.Parent = parent
+		return t
+	end
+
+	-- [SPIES:PANEL] makePanel() builds a tab: toolbar buttons/boxes + log list + detail box.
+	-- A panel = toolbar + log list (left) + detail box (right)
+	-- cfg.buttons = { {text, width, fn(btn, panel)} ... }, cfg.boxes = { {placeholder, width, key} ... }
+	local MAX_ROWS = 400
+	local function makePanel(cfg)
+		local P = {rows = {}, counter = 0, boxes = {}, selected = nil}
+
+		local frame = Instance.new("Frame")
+		frame.Name = cfg.name
+		frame.BackgroundTransparency = 1
+		frame.Size = UDim2.new(1, 0, 1, 0)
+		frame.Visible = false
+		frame.Parent = body
+		P.Frame = frame
+
+		local toolbar = Instance.new("ScrollingFrame")
+		toolbar.BackgroundColor3 = C.Main2()
+		toolbar.BorderSizePixel = 0
+		toolbar.Size = UDim2.new(1, 0, 0, 44)
+		toolbar.ScrollBarThickness = 3
+		toolbar.CanvasSize = UDim2.new(0, 0, 0, 0)
+		toolbar.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		toolbar.ScrollingDirection = Enum.ScrollingDirection.Y
+		toolbar.Parent = frame
+		local tl = Instance.new("UIListLayout")
+		tl.FillDirection = Enum.FillDirection.Horizontal
+		tl.Wraps = true
+		tl.Padding = UDim.new(0, 3)
+		tl.SortOrder = Enum.SortOrder.LayoutOrder
+		tl.Parent = toolbar
+		local tp = Instance.new("UIPadding")
+		tp.PaddingLeft = UDim.new(0, 3)
+		tp.PaddingTop = UDim.new(0, 2)
+		tp.Parent = toolbar
+
+		for _, bx in ipairs(cfg.boxes or {}) do
+			P.boxes[bx[3]] = mkBox(toolbar, bx[1], bx[2])
+		end
+		for _, bt in ipairs(cfg.buttons or {}) do
+			local b
+			b = mkButton(toolbar, bt[1], bt[2], function() bt[3](b, P) end)
+			if bt[4] then bt[4](b, P) end
+		end
+
+		local list = Instance.new("ScrollingFrame")
+		list.BackgroundColor3 = C.Main1()
+		list.BorderSizePixel = 0
+		list.Position = UDim2.new(0, 0, 0, 46)
+		list.Size = UDim2.new(0.42, -2, 1, -46)
+		list.ScrollBarThickness = 8
+		list.CanvasSize = UDim2.new(0, 0, 0, 0)
+		list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		list.Parent = frame
+		local ll = Instance.new("UIListLayout")
+		ll.SortOrder = Enum.SortOrder.LayoutOrder
+		ll.Parent = list
+		P.List = list
+
+		local detail = Instance.new("TextBox")
+		detail.BackgroundColor3 = C.Main1()
+		detail.BorderSizePixel = 0
+		detail.Position = UDim2.new(0.42, 0, 0, 46)
+		detail.Size = UDim2.new(0.58, 0, 1, -46)
+		detail.TextColor3 = C.Text()
+		detail.Font = Enum.Font.Code
+		detail.TextSize = 13
+		detail.TextXAlignment = Enum.TextXAlignment.Left
+		detail.TextYAlignment = Enum.TextYAlignment.Top
+		detail.ClearTextOnFocus = false
+		detail.MultiLine = true
+		detail.TextWrapped = false
+		detail.Text = cfg.hint or ""
+		detail.Parent = frame
+		P.Detail = detail
+
+		function P.setDetail(text)
+			if #text > 60000 then text = text:sub(1, 60000) .. "\n-- ... output truncated" end
+			detail.Text = text
+		end
+
+		function P.addRow(text, color, data, onSelect)
+			P.counter = P.counter + 1
+			local btn = Instance.new("TextButton")
+			btn.Size = UDim2.new(1, 0, 0, 18)
+			btn.BackgroundColor3 = C.Main1()
+			btn.BorderSizePixel = 0
+			btn.AutoButtonColor = false
+			btn.Font = Enum.Font.SourceSans
+			btn.TextSize = 14
+			btn.TextColor3 = color or C.Text()
+			btn.TextXAlignment = Enum.TextXAlignment.Left
+			btn.TextTruncate = Enum.TextTruncate.AtEnd
+			btn.Text = " " .. text
+			btn.LayoutOrder = cfg.oldestFirst and P.counter or -P.counter
+			btn.Parent = list
+			local row = {Button = btn, Data = data, Color = color}
+			P.rows[#P.rows + 1] = row
+			btn.MouseButton1Click:Connect(function()
+				if P.selected then P.selected.Button.BackgroundColor3 = C.Main1() end
+				P.selected = row
+				btn.BackgroundColor3 = C.Sel()
+				if onSelect then
+					local ok, err = pcall(onSelect, row)
+					if not ok then P.setDetail("-- error while rendering details:\n" .. tostring(err)) end
+				end
+			end)
+			if #P.rows > MAX_ROWS then
+				local old = table.remove(P.rows, 1)
+				if P.selected == old then P.selected = nil end
+				old.Button:Destroy()
+			end
+			return row
+		end
+
+		function P.clear()
+			for _, r in ipairs(P.rows) do r.Button:Destroy() end
+			P.rows = {}
+			P.selected = nil
+			detail.Text = ""
+		end
+
+		function P.setRowColor(row, color)
+			row.Color = color
+			row.Button.TextColor3 = color or C.Text()
+		end
+
+		return P
+	end
+
+	local function addTab(name, buildFn)
+		local t = {Name = name}
+		tabs[#tabs + 1] = t
+		local idx = #tabs
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1 / 7, -2, 1, 0)
+		b.BackgroundColor3 = C.Button()
+		b.BorderSizePixel = 0
+		b.TextColor3 = C.Text()
+		b.Font = Enum.Font.SourceSansBold
+		b.TextSize = 14
+		b.Text = name
+		b.LayoutOrder = idx
+		b.Parent = tabBar
+		t.Button = b
+		t.Panel = buildFn()
+		b.MouseButton1Click:Connect(function() Spies.SelectTab(idx) end)
+		return t
+	end
+
+	Spies.SelectTab = function(idx)
+		for i, t in ipairs(tabs) do
+			local on = i == idx
+			t.Panel.Frame.Visible = on
+			t.Button.BackgroundColor3 = on and C.Sel() or C.Button()
+		end
+		currentTab = idx
+	end
+
+	---------------------------------------------------------------------
+	-- Event queue (decouples hooks from UI work)
+	---------------------------------------------------------------------
+	local queue = {}
+	local function push(fn)
+		if #queue < 2000 then queue[#queue + 1] = fn end
+	end
+	local queueCon
+	local function startQueue()
+		if queueCon then return end
+		queueCon = RunService.Heartbeat:Connect(function()
+			local n = 0
+			while #queue > 0 and n < 12 do
+				local fn = table.remove(queue, 1)
+				local ok, err = pcall(fn)
+				if not ok then warn("[BAD DEX Spies] " .. tostring(err)) end
+				n = n + 1
+			end
+		end)
+	end
+
+	---------------------------------------------------------------------
+	-- Remote engine (Cobalt tab)
+	---------------------------------------------------------------------
+	local Remote = {
+		installed = false,
+		simple = false, cobalt = false,
+		incoming = true, bindables = false, trace = true,
+		blocked = {}, simpleIgnored = {}, cobaltIgnored = {},
+		inCall = setmetatable({}, {__mode = "k"}),
+		incomingCons = {}, incomingConnected = false,
+		counter = 0,
+	}
+	local OUT = {FireServer = true, fireServer = true, InvokeServer = true, invokeServer = true}
+	local OUTB = {Fire = true, fire = true, Invoke = true, invoke = true}
+	local REMOTE_CLASSES = {RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true}
+	local BIND_CLASSES = {BindableEvent = true, BindableFunction = true}
+
+	local function classifyCall(obj, method)
+		local ok, cn = pcall(function() return obj.ClassName end)
+		if not ok or type(cn) ~= "string" then return nil end
+		if REMOTE_CLASSES[cn] and OUT[method] then return cn end
+		if Remote.bindables and BIND_CLASSES[cn] and OUTB[method] then return cn end
+		return nil
+	end
+
+	local dispatchRemote -- defined after panels exist
+
+	local function recordRemote(dir, remote, cn, method, args)
+		Remote.counter = Remote.counter + 1
+		local e = {
+			id = Remote.counter, dir = dir, remote = remote, name = remote.Name,
+			class = cn, method = method, args = args, clock = nowStr(),
+		}
+		if dir ~= "in" then
+			local gcs = G("getcallingscript")
+			if gcs then
+				local ok, s = pcall(gcs)
+				if ok then e.script = s end
+			end
+			if Remote.cobalt and Remote.trace then
+				e.trace = debug.traceback("", 3)
+			end
+		end
+		e.blocked = Remote.blocked[remote] == true
+		push(function() dispatchRemote(e) end)
+		return e
+	end
+
+	local function installRemote()
+		if Remote.installed then return true end
+		local hookmm, getnc = G("hookmetamethod"), G("getnamecallmethod")
+		if not (hookmm and getnc) then
+			return false, "executor lacks hookmetamethod / getnamecallmethod"
+		end
+		local setnc = G("setnamecallmethod")
+		local newcc = G("newcclosure") or function(f) return f end
+		local checkcaller = G("checkcaller") or function() return false end
+
+		-- [SPIES:REMOTE-HOOK] called for EVERY FireServer / InvokeServer (namecall and direct form).
+		-- This is the place to add your own logic: filter/rewrite `...` before oldFn(self, ...),
+		-- change what gets recorded (recordRemote), or decide what is blocked (Remote.blocked).
+		local function handle(oldFn, isNC, self, method, ...)
+			if isNC and setnc then setnc(method) end
+			local co = coroutine.running()
+			if Remote.inCall[co] or checkcaller() then return oldFn(self, ...) end
+			local cn = classifyCall(self, method)
+			if not cn then
+				if isNC and setnc then setnc(method) end
+				return oldFn(self, ...)
+			end
+			local e = recordRemote("out", self, cn, method, pack(...))
+			if e.blocked then return nil end
+			Remote.inCall[co] = true
+			push(function() Remote.inCall[co] = nil end)
+			if isNC and setnc then setnc(method) end
+			local r = pack(oldFn(self, ...))
+			Remote.inCall[co] = nil
+			e.ret = r
+			return unpack(r, 1, r.n)
+		end
+
+		-- [SPIES:NAMECALL-HOOK] the single global __namecall hook used by the Cobalt tab.
+		-- How it is installed (hookmetamethod, newcclosure wrapper) is decided here.
+		local oldNC
+		oldNC = hookmm(game, "__namecall", newcc(function(self, ...)
+			local method = getnc()
+			if Remote.cobalt and type(method) == "string" and (OUT[method] or OUTB[method]) then
+				return handle(oldNC, true, self, method, ...)
+			end
+			return oldNC(self, ...)
+		end))
+
+		-- [SPIES:DIRECT-HOOK] direct calls: remote.FireServer(remote, ...)
+		local hookf = G("hookfunction")
+		if hookf then
+			local function hookDirect(className, method)
+				local ok, err = pcall(function()
+					local inst = Instance.new(className)
+					local f = inst[method]
+					inst:Destroy()
+					local old
+					old = hookf(f, newcc(function(self, ...)
+						if Remote.cobalt then
+							return handle(old, false, self, method, ...)
+						end
+						return old(self, ...)
+					end))
+				end)
+				if not ok then warn("[BAD DEX Spies] direct hook " .. className .. "." .. method .. " failed: " .. tostring(err)) end
+			end
+			hookDirect("RemoteEvent", "FireServer")
+			hookDirect("RemoteFunction", "InvokeServer")
+			pcall(hookDirect, "UnreliableRemoteEvent", "FireServer")
+			pcall(hookDirect, "BindableEvent", "Fire")
+			pcall(hookDirect, "BindableFunction", "Invoke")
+		end
+
+		Remote.installed = true
+		startQueue()
+		return true
+	end
+
+	local function connectIncoming()
+		if Remote.incomingConnected then return end
+		Remote.incomingConnected = true
+		local function hookRemote(r)
+			local ok, con = pcall(function()
+				return r.OnClientEvent:Connect(function(...)
+					if Remote.cobalt and Remote.incoming and not Remote.cobaltIgnored[r] then
+						recordRemote("in", r, r.ClassName, "OnClientEvent", pack(...))
+					end
+				end)
+			end)
+			if ok and con then table.insert(Remote.incomingCons, con) end
+		end
+		for _, d in ipairs(game:GetDescendants()) do
+			if d:IsA("BaseRemoteEvent") then hookRemote(d) end
+		end
+		Remote.descCon = game.DescendantAdded:Connect(function(d)
+			if d:IsA("BaseRemoteEvent") then hookRemote(d) end
+		end)
+	end
+
+	local function disconnectIncoming()
+		for _, c in ipairs(Remote.incomingCons) do pcall(function() c:Disconnect() end) end
+		Remote.incomingCons = {}
+		if Remote.descCon then Remote.descCon:Disconnect() Remote.descCon = nil end
+		Remote.incomingConnected = false
+	end
+
+	local function replayRemote(e)
+		local r = e.remote
+		if e.dir == "in" then
+			local fs = G("firesignal")
+			if not fs then error("firesignal is not supported by your executor") end
+			fs(r.OnClientEvent, unpack(e.args, 1, e.args.n))
+		else
+			task.spawn(function()
+				local ok, err = pcall(function() return r[e.method](r, unpack(e.args, 1, e.args.n)) end)
+				if not ok then warn("[BAD DEX Spies] replay failed: " .. tostring(err)) end
+			end)
+		end
+	end
+
+	local function scriptPath(s)
+		if typeof(s) == "Instance" then return pathOf(s) end
+		return "nil"
+	end
+
+	local function remoteDetail(e, full)
+		local out = {}
+		out[#out + 1] = "-- Remote:  " .. pathOf(e.remote)
+		out[#out + 1] = "-- Class:   " .. e.class .. "   Method: " .. e.method .. "   Time: " .. e.clock
+		out[#out + 1] = "-- Calling script: " .. scriptPath(e.script)
+		if e.blocked then out[#out + 1] = "-- BLOCKED: this call never reached the server" end
+		if e.ret then
+			local rp = serializeArgs(e.ret)
+			out[#out + 1] = "-- Return (" .. e.ret.n .. "): " .. (table.concat(rp, ", "):gsub("\n", "\n--   "))
+		elseif e.method:lower() == "invokeserver" and not e.blocked and not e.noReturn then
+			out[#out + 1] = "-- Return: (still pending / errored)"
+		end
+		out[#out + 1] = ""
+		out[#out + 1] = genRemoteCode(e)
+		if full and e.trace and e.trace ~= "" then
+			out[#out + 1] = ""
+			out[#out + 1] = "--[[ traceback"
+			out[#out + 1] = traceBlock(e.trace)
+			out[#out + 1] = "]]"
+		end
+		return table.concat(out, "\n")
+	end
+
+	local function remoteRowText(e)
+		local arrow = e.dir == "in" and "<- " or "-> "
+		return string.format("[%s] %s%s : %s", e.clock, arrow, e.name, e.method)
+	end
+
+	local function toggleText(label, on) return label .. ": " .. (on and "ON" or "OFF") end
+
+	local function buildRemotePanel(kind)
+		local isCobalt = kind == "cobalt"
+		local ignoredSet = isCobalt and Remote.cobaltIgnored or Remote.simpleIgnored
+		local P
+
+		local function sel() return P.selected and P.selected.Data end
+		local function needSel()
+			local e = sel()
+			if not e then P.setDetail("-- select a call first") end
+			return e
+		end
+
+		local buttons = {}
+		local function add(text, width, fn, init) buttons[#buttons + 1] = {text, width, fn, init} end
+
+		add("Enable: OFF", 84, function(btn)
+			local flag = isCobalt and "cobalt" or "simple"
+			if not Remote[flag] then
+				local ok, err = installRemote()
+				if not ok then P.setDetail("-- cannot enable: " .. tostring(err)) return end
+				Remote[flag] = true
+				if isCobalt and Remote.incoming then connectIncoming() end
+			else
+				Remote[flag] = false
+				if isCobalt then disconnectIncoming() end
+			end
+			btn.Text = toggleText("Enable", Remote[flag])
+		end, function(btn) btn.Text = toggleText("Enable", Remote[isCobalt and "cobalt" or "simple"]) end)
+
+		if isCobalt then
+			add("Incoming: ON", 86, function(btn)
+				Remote.incoming = not Remote.incoming
+				if Remote.cobalt then
+					if Remote.incoming then connectIncoming() else disconnectIncoming() end
+				end
+				btn.Text = toggleText("Incoming", Remote.incoming)
+			end, function(btn) btn.Text = toggleText("Incoming", Remote.incoming) end)
+			add("Bindables: OFF", 94, function(btn)
+				Remote.bindables = not Remote.bindables
+				btn.Text = toggleText("Bindables", Remote.bindables)
+			end, function(btn) btn.Text = toggleText("Bindables", Remote.bindables) end)
+			add("Trace: ON", 70, function(btn)
+				Remote.trace = not Remote.trace
+				btn.Text = toggleText("Trace", Remote.trace)
+			end, function(btn) btn.Text = toggleText("Trace", Remote.trace) end)
+		end
+
+		add("Copy Code", 70, function()
+			local e = needSel() if not e then return end
+			if not copyText(genRemoteCode(e)) then P.setDetail("-- executor has no setclipboard; copy the code from this box\n\n" .. genRemoteCode(e)) end
+		end)
+		add(isCobalt and "Replay" or "Run", 56, function()
+			local e = needSel() if not e then return end
+			replayRemote(e)
+		end)
+		add("Copy Path", 70, function()
+			local e = needSel() if not e then return end
+			copyText(pathOf(e.remote))
+		end)
+		if isCobalt then
+			add("View Script", 76, function()
+				local e = needSel() if not e then return end
+				if typeof(e.script) == "Instance" and ScriptViewer then
+					ScriptViewer.ViewScript(e.script)
+				else
+					P.setDetail("-- no calling script recorded for this call")
+				end
+			end)
+		end
+		add("Ignore", 56, function()
+			local e = needSel() if not e then return end
+			ignoredSet[e.remote] = true
+			P.setDetail("-- ignoring " .. e.name .. " (use Reset to undo)")
+		end)
+		add("Block", 52, function(btn)
+			local e = needSel() if not e then return end
+			Remote.blocked[e.remote] = not Remote.blocked[e.remote] or nil
+			P.setDetail("-- " .. e.name .. (Remote.blocked[e.remote] and " is now BLOCKED (calls are dropped client-side)" or " is no longer blocked"))
+		end)
+		add("Reset", 52, function()
+			table.clear(ignoredSet)
+			table.clear(Remote.blocked)
+			P.setDetail("-- cleared ignored / blocked lists")
+		end)
+		add("Clear", 52, function() P.clear() end)
+
+		P = makePanel({
+			name = isCobalt and "Cobalt" or "SimpleSpy",
+			buttons = buttons,
+			hint = (isCobalt and "-- Cobalt: outgoing + incoming remote traffic, return values, calling script, traceback.\n"
+				or "-- SimpleSpy: outgoing remote calls with copy-pasteable code.\n")
+				.. "-- Press Enable, then do something in the game. Click a call to see the generated code.\n"
+				.. "-- Needs hookmetamethod + getnamecallmethod (hookfunction/getcallingscript/firesignal improve it).",
+		})
+		if isCobalt then Spies.CobaltPanel = P else Spies.SimplePanel = P end
+		return P
+	end
+
+	dispatchRemote = function(e)
+		local function show(P, ignored, full)
+			if ignored[e.remote] then return end
+			local color = e.blocked and COL_BLOCK or (e.dir == "in" and COL_IN or COL_OUT)
+			P.addRow(remoteRowText(e), color, e, function(row) P.setDetail(remoteDetail(row.Data, full)) end)
+		end
+		if Remote.cobalt and Spies.CobaltPanel then show(Spies.CobaltPanel, Remote.cobaltIgnored, true) end
+	end
+
+	---------------------------------------------------------------------
+	-- Function inspection helpers (Hydroxide / Closure Spy)
+	---------------------------------------------------------------------
+	local function fnInfo(f)
+		local getinfo = (debug and debug.getinfo) or G("getinfo")
+		if getinfo then
+			local ok, i = pcall(getinfo, f)
+			if ok and type(i) == "table" then return i end
+		end
+		return {}
+	end
+
+	local function fnScript(f)
+		local ok, e = pcall(getfenv, f)
+		if ok and type(e) == "table" then
+			local ok2, s = pcall(rawget, e, "script")
+			if ok2 and typeof(s) == "Instance" then return s end
+		end
+		return nil
+	end
+
+	local function isCClosure(f)
+		local iscc = G("iscclosure")
+		if iscc then
+			local ok, r = pcall(iscc, f)
+			if ok then return r end
+		end
+		return false
+	end
+
+	local function isExecClosure(f)
+		local fn = G("isexecutorclosure") or G("checkclosure") or G("is_synapse_function") or G("is_executor_closure")
+		if fn then
+			local ok, r = pcall(fn, f)
+			if ok then return r end
+		end
+		return false
+	end
+
+	local function oneLine(v, cap)
+		local ok, s = pcall(serialize, v, 0, {}, 5)
+		if not ok then s = tostring(v) end
+		s = s:gsub("%s+", " ")
+		cap = cap or 120
+		if #s > cap then s = s:sub(1, cap) .. "..." end
+		return s
+	end
+
+	local function describeFn(f)
+		if type(f) ~= "function" then return tostring(f) end
+		local i = fnInfo(f)
+		local scr = fnScript(f)
+		return string.format("%s [%s:%s] %s%s",
+			(i.name and i.name ~= "") and i.name or "anonymous",
+			scr and scr.Name or tostring(i.short_src or i.source or "?"),
+			tostring(i.linedefined or i.currentline or "?"),
+			isCClosure(f) and "C closure" or "Lua closure",
+			isExecClosure(f) and ", executor" or "")
+	end
+
+	local function fnDetail(f)
+		local out = {}
+		local i = fnInfo(f)
+		local scr = fnScript(f)
+		out[#out + 1] = "-- Function: " .. ((i.name and i.name ~= "") and i.name or "anonymous")
+		out[#out + 1] = "-- Type:     " .. (isCClosure(f) and "C closure" or "Lua closure") .. (isExecClosure(f) and " (executor)" or "")
+		out[#out + 1] = "-- Script:   " .. (scr and pathOf(scr) or "unknown")
+		out[#out + 1] = "-- Source:   " .. tostring(i.source or i.short_src or "?") .. "   line " .. tostring(i.linedefined or "?")
+		out[#out + 1] = "-- Params:   " .. tostring(i.numparams or i.nparams or "?") .. "   vararg: " .. tostring(i.is_vararg or i.isvararg or "?")
+		local fnames = {
+			ups = G("getupvalues") or (debug and debug.getupvalues),
+			consts = G("getconstants") or (debug and debug.getconstants),
+			protos = G("getprotos") or (debug and debug.getprotos),
+		}
+		if fnames.ups then
+			local ok, ups = pcall(fnames.ups, f)
+			if ok and type(ups) == "table" then
+				local keys = {}
+				for k in pairs(ups) do keys[#keys + 1] = k end
+				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+				out[#out + 1] = ""
+				out[#out + 1] = "-- Upvalues (" .. #keys .. "):"
+				for n, k in ipairs(keys) do
+					if n > 80 then out[#out + 1] = "--   ..." break end
+					out[#out + 1] = "--   [" .. tostring(k) .. "] (" .. typeof(ups[k]) .. ") = " .. oneLine(ups[k])
+				end
+			end
+		end
+		if fnames.consts then
+			local ok, cs = pcall(fnames.consts, f)
+			if ok and type(cs) == "table" then
+				local keys = {}
+				for k in pairs(cs) do keys[#keys + 1] = k end
+				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+				out[#out + 1] = ""
+				out[#out + 1] = "-- Constants (" .. #keys .. "):"
+				for n, k in ipairs(keys) do
+					if n > 120 then out[#out + 1] = "--   ..." break end
+					out[#out + 1] = "--   [" .. tostring(k) .. "] " .. oneLine(cs[k], 100)
+				end
+			end
+		end
+		if fnames.protos then
+			local ok, ps = pcall(fnames.protos, f)
+			if ok and type(ps) == "table" then
+				out[#out + 1] = ""
+				out[#out + 1] = "-- Protos: " .. #ps
+				for n, p in ipairs(ps) do
+					if n > 40 then break end
+					if type(p) == "function" then out[#out + 1] = "--   " .. describeFn(p) end
+				end
+			end
+		end
+		return table.concat(out, "\n")
+	end
+
+	local function compileExpr(src)
+		local ls = G("loadstring") or loadstring
+		if not ls then return nil, "loadstring not available" end
+		local fn, err = ls("return " .. src)
+		if not fn then return nil, err end
+		return fn
+	end
+
+	---------------------------------------------------------------------
+	-- Closure Spy
+	---------------------------------------------------------------------
+	local Closure = {hooked = {}, list = {}}
+	local dispatchClosure
+
+	local function hookClosure(f, label)
+		if type(f) ~= "function" then return false, "not a function" end
+		if Closure.hooked[f] then return false, "already hooked" end
+		local hookf = G("hookfunction")
+		if not hookf then return false, "executor lacks hookfunction" end
+		local newcc = G("newcclosure") or function(x) return x end
+		local checkcaller = G("checkcaller") or function() return false end
+		local rec = {fn = f, label = label or fnName(f), active = true, block = false, calls = 0}
+		local old
+		-- [SPIES:CLOSURE-HOOK] wrapper that replaces every hooked closure; logging + blocking happen here
+		local function wrapper(...)
+			if rec.active and not checkcaller() then
+				rec.calls = rec.calls + 1
+				local e = {rec = rec, args = pack(...), clock = nowStr(), trace = debug.traceback("", 2)}
+				push(function() dispatchClosure(e) end)
+				if rec.block then return end
+				local r = pack(old(...))
+				e.ret = r
+				return unpack(r, 1, r.n)
+			end
+			return old(...)
+		end
+		local wrapped = wrapper
+		if isCClosure(f) then wrapped = newcc(wrapper) end
+		local ok, res = pcall(hookf, f, wrapped)
+		if not ok then return false, tostring(res) end
+		old = res
+		Closure.hooked[f] = rec
+		Closure.list[#Closure.list + 1] = rec
+		startQueue()
+		return true, rec
+	end
+
+	local function unhookClosure(rec)
+		rec.active = false
+		local rf = G("restorefunction")
+		if rf then pcall(rf, rec.fn) end
+		Closure.hooked[rec.fn] = nil
+	end
+
+	local function gcFunctions()
+		local getgc = G("getgc")
+		if not getgc then return nil, "executor lacks getgc" end
+		local ok, list = pcall(getgc, true)
+		if not ok or type(list) ~= "table" then
+			ok, list = pcall(getgc)
+		end
+		if not ok then return nil, tostring(list) end
+		return list
+	end
+
+	local function buildClosurePanel()
+		local P
+		local function needRec()
+			local row = P.selected
+			if not row or not row.Data then P.setDetail("-- select a logged call first") return nil end
+			return row.Data.rec, row.Data
+		end
+		local buttons = {
+			{"Hook by name", 90, function()
+				local name = P.boxes.name.Text
+				if name == "" then P.setDetail("-- type a function name into the box first") return end
+				local list, err = gcFunctions()
+				if not list then P.setDetail("-- " .. tostring(err)) return end
+				local n = 0
+				for _, f in ipairs(list) do
+					if type(f) == "function" and not isCClosure(f) and not isExecClosure(f) then
+						local nm = fnInfo(f).name
+						if nm == name then
+							local ok = hookClosure(f, name)
+							if ok then n = n + 1 end
+							if n >= 25 then break end
+						end
+					end
+				end
+				P.setDetail("-- hooked " .. n .. " closure(s) named '" .. name .. "'. Trigger them in-game and calls will show here.")
+			end},
+			{"Hooked list", 76, function()
+				local out = {"-- Hooked closures:"}
+				for i, rec in ipairs(Closure.list) do
+					out[#out + 1] = string.format("-- %d. %s  calls=%d  %s%s", i, rec.label, rec.calls, rec.active and "active" or "unhooked", rec.block and "  BLOCKING" or "")
+				end
+				P.setDetail(table.concat(out, "\n"))
+			end},
+			{"Block", 52, function()
+				local rec = needRec() if not rec then return end
+				rec.block = not rec.block
+				P.setDetail("-- " .. rec.label .. (rec.block and " now BLOCKED (original is not called)" or " no longer blocked"))
+			end},
+			{"Unhook", 60, function()
+				local rec = needRec() if not rec then return end
+				unhookClosure(rec)
+				P.setDetail("-- unhooked " .. rec.label)
+			end},
+			{"Unhook All", 74, function()
+				for _, rec in ipairs(Closure.list) do unhookClosure(rec) end
+				P.setDetail("-- all closures unhooked")
+			end},
+			{"Copy Args", 70, function()
+				local _, e = needRec() if not e then return end
+				local parts = serializeArgs(e.args)
+				copyText("-- " .. e.rec.label .. " args\nreturn " .. table.concat(parts, ", "))
+			end},
+			{"Clear", 52, function() P.clear() end},
+		}
+		P = makePanel({
+			name = "ClosureSpy",
+			buttons = buttons,
+			boxes = {{"function name to hook", 150, "name"}},
+			hint = "-- Closure Spy: logs calls (args, returns, traceback) of hooked Lua closures.\n"
+				.. "-- Hook a function by name (getgc scan), or use Hydroxide -> pick a function -> 'Spy Closure'.\n"
+				.. "-- Needs hookfunction (+ getgc for name search).",
+		})
+		Spies.ClosurePanel = P
+		return P
+	end
+
+	dispatchClosure = function(e)
+		local P = Spies.ClosurePanel
+		if not P then return end
+		local previews = {}
+		for i = 1, math.min(e.args.n, 4) do previews[i] = oneLine(e.args[i], 24) end
+		local text = string.format("[%s] %s(%s%s)", e.clock, e.rec.label, table.concat(previews, ", "), e.args.n > 4 and ", ..." or "")
+		P.addRow(text, e.rec.block and COL_BLOCK or COL_OUT, e, function(row)
+			local d = row.Data
+			local out = {}
+			out[#out + 1] = "-- Closure: " .. d.rec.label .. "   total calls: " .. d.rec.calls .. (d.rec.block and "   [BLOCKING]" or "")
+			out[#out + 1] = "-- Time: " .. d.clock
+			out[#out + 1] = ""
+			out[#out + 1] = "-- Arguments (" .. d.args.n .. "):"
+			local ps = serializeArgs(d.args)
+			for i = 1, d.args.n do out[#out + 1] = "local arg" .. i .. " = " .. ps[i] end
+			if d.ret then
+				out[#out + 1] = ""
+				out[#out + 1] = "-- Returned (" .. d.ret.n .. "):"
+				local rs = serializeArgs(d.ret)
+				for i = 1, d.ret.n do out[#out + 1] = "local ret" .. i .. " = " .. rs[i] end
+			elseif d.rec.block then
+				out[#out + 1] = ""
+				out[#out + 1] = "-- (call was blocked, nothing returned)"
+			end
+			if d.trace then
+				out[#out + 1] = ""
+				out[#out + 1] = "--[[ traceback"
+				out[#out + 1] = traceBlock(d.trace)
+				out[#out + 1] = "]]"
+			end
+			P.setDetail(table.concat(out, "\n"))
+		end)
+	end
+
+	---------------------------------------------------------------------
+	-- Hydroxide (scanner: functions / scripts / modules / remotes)
+	---------------------------------------------------------------------
+	local Hydro = {mode = 1, scanning = false}
+	local HYDRO_MODES = {"Functions", "Scripts", "Modules", "Remotes"}
+
+	local function matchesFilter(fl, ...)
+		if fl == "" then return true end
+		for i = 1, select("#", ...) do
+			local s = select(i, ...)
+			if type(s) == "string" and s:lower():find(fl, 1, true) then return true end
+		end
+		return false
+	end
+
+	local function fnMatches(f, fl, info, scr)
+		if fl == "" then return true end
+		if matchesFilter(fl, info.name or "", tostring(info.short_src or info.source or ""), scr and pathOf(scr) or "") then return true end
+		local gcn, gup = G("getconstants") or (debug and debug.getconstants), G("getupvalues") or (debug and debug.getupvalues)
+		if gcn then
+			local ok, cs = pcall(gcn, f)
+			if ok and type(cs) == "table" then
+				for _, c in pairs(cs) do
+					if type(c) == "string" and c:lower():find(fl, 1, true) then return true end
+				end
+			end
+		end
+		if gup then
+			local ok, us = pcall(gup, f)
+			if ok and type(us) == "table" then
+				for _, u in pairs(us) do
+					if type(u) == "string" and u:lower():find(fl, 1, true) then return true end
+				end
+			end
+		end
+		return false
+	end
+
+	local function scriptDetail(inst)
+		local out = {}
+		out[#out + 1] = "-- Script:  " .. pathOf(inst)
+		out[#out + 1] = "-- Class:   " .. inst.ClassName
+		pcall(function()
+			if inst:IsA("BaseScript") then
+				out[#out + 1] = "-- Enabled: " .. tostring(inst.Enabled) .. "   RunContext: " .. tostring(inst.RunContext)
+			end
+		end)
+		local gse = G("getsenv")
+		if gse and inst.ClassName ~= "Script" then
+			local ok, senv = pcall(gse, inst)
+			if ok and type(senv) == "table" then
+				local keys = {}
+				for k in pairs(senv) do keys[#keys + 1] = k end
+				table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+				out[#out + 1] = ""
+				out[#out + 1] = "-- Script environment (getsenv) - " .. #keys .. " entries:"
+				for n, k in ipairs(keys) do
+					if n > 150 then out[#out + 1] = "--   ..." break end
+					local v = senv[k]
+					if type(v) == "function" then
+						out[#out + 1] = "--   " .. tostring(k) .. " = " .. describeFn(v)
+					else
+						out[#out + 1] = "--   " .. tostring(k) .. " (" .. typeof(v) .. ") = " .. oneLine(v)
+					end
+				end
+			else
+				out[#out + 1] = ""
+				out[#out + 1] = "-- getsenv failed (script not running / not supported)"
+			end
+		end
+		return table.concat(out, "\n")
+	end
+
+	local function remoteHandlers(r)
+		local list = {}
+		local gcon = G("getconnections")
+		if gcon and (r:IsA("BaseRemoteEvent")) then
+			local ok, cons = pcall(gcon, r.OnClientEvent)
+			if ok and type(cons) == "table" then
+				for _, c in ipairs(cons) do
+					local okf, f = pcall(function() return c.Function end)
+					list[#list + 1] = {con = c, fn = okf and type(f) == "function" and f or nil}
+				end
+			end
+		elseif r:IsA("RemoteFunction") then
+			local gcb = G("getcallbackvalue")
+			if gcb then
+				local ok, f = pcall(gcb, r, "OnClientInvoke")
+				if ok and type(f) == "function" then list[#list + 1] = {fn = f} end
+			end
+		end
+		return list
+	end
+
+	local function remoteDetailHydro(r)
+		local out = {}
+		out[#out + 1] = "-- Remote: " .. pathOf(r)
+		out[#out + 1] = "-- Class:  " .. r.ClassName
+		local hs = remoteHandlers(r)
+		out[#out + 1] = ""
+		out[#out + 1] = "-- Client handlers (" .. #hs .. "):"
+		for i, h in ipairs(hs) do
+			local enabled = ""
+			if h.con then
+				local ok, en = pcall(function() return h.con.Enabled end)
+				if ok then enabled = "  enabled=" .. tostring(en) end
+			end
+			out[#out + 1] = "--   " .. i .. ". " .. (h.fn and describeFn(h.fn) or "(no Lua function / C connection)") .. enabled
+		end
+		out[#out + 1] = ""
+		out[#out + 1] = "local remote = " .. pathOf(r)
+		if r:IsA("RemoteFunction") then
+			out[#out + 1] = "-- remote:InvokeServer(...)"
+		elseif r:IsA("BaseRemoteEvent") then
+			out[#out + 1] = "-- remote:FireServer(...)"
+		end
+		return table.concat(out, "\n")
+	end
+
+	local function moduleDetail(m)
+		local out = {}
+		out[#out + 1] = "-- ModuleScript: " .. pathOf(m)
+		local ok, res = pcall(require, m)
+		out[#out + 1] = ""
+		if not ok then
+			out[#out + 1] = "-- require failed: " .. tostring(res)
+		else
+			out[#out + 1] = "-- require() returned (" .. typeof(res) .. "):"
+			local okS, s = pcall(serialize, res, 0, {}, 0)
+			out[#out + 1] = "local module = " .. (okS and s or tostring(res))
+		end
+		return table.concat(out, "\n")
+	end
+
+	-- [SPIES:HYDROXIDE] scanner tab: scan() has one branch per mode (Functions/Scripts/Modules/Remotes)
+	local function buildHydroPanel()
+		local P
+
+		local function scan()
+			if Hydro.scanning then P.setDetail("-- scan already running") return end
+			Hydro.scanning = true
+			P.clear()
+			local mode = Hydro.mode
+			local fl = P.boxes.filter.Text:lower()
+			task.spawn(function()
+				local ok, err = pcall(function()
+					local count = 0
+					local CAP = 400
+					if mode == 1 then
+						local list, e = gcFunctions()
+						if not list then error(e, 0) end
+						for idx, f in ipairs(list) do
+							if idx % 1500 == 0 then task.wait() end
+							if type(f) == "function" and not isCClosure(f) and not isExecClosure(f) then
+								local info = fnInfo(f)
+								local scr = fnScript(f)
+								if (fl ~= "" or (info.name and info.name ~= "")) and fnMatches(f, fl, info, scr) then
+									local nm = (info.name and info.name ~= "") and info.name or "anonymous"
+									P.addRow(string.format("%s  [%s:%s]", nm, scr and scr.Name or tostring(info.short_src or "?"), tostring(info.linedefined or "?")),
+										nil, {kind = "fn", fn = f}, function(row) P.setDetail(fnDetail(row.Data.fn)) end)
+									count = count + 1
+									if count >= CAP then break end
+								end
+							end
+						end
+					elseif mode == 2 then
+						local gs = G("getscripts")
+						local list
+						if gs then
+							local ok2, r = pcall(gs)
+							if ok2 then list = r end
+						end
+						if not list then
+							list = {}
+							for _, d in ipairs(game:GetDescendants()) do
+								if d:IsA("LuaSourceContainer") then list[#list + 1] = d end
+							end
+						end
+						for idx, s in ipairs(list) do
+							if idx % 800 == 0 then task.wait() end
+							if typeof(s) == "Instance" and matchesFilter(fl, s.Name, pathOf(s), s.ClassName) then
+								P.addRow("[" .. s.ClassName .. "] " .. s.Name, nil, {kind = "script", inst = s},
+									function(row) P.setDetail(scriptDetail(row.Data.inst)) end)
+								count = count + 1
+								if count >= CAP then break end
+							end
+						end
+					elseif mode == 3 then
+						local glm = G("getloadedmodules")
+						local list
+						if glm then
+							local ok2, r = pcall(glm)
+							if ok2 then list = r end
+						end
+						if not list then
+							list = {}
+							for _, d in ipairs(game:GetDescendants()) do
+								if d:IsA("ModuleScript") then list[#list + 1] = d end
+							end
+						end
+						for idx, m in ipairs(list) do
+							if idx % 800 == 0 then task.wait() end
+							if typeof(m) == "Instance" and matchesFilter(fl, m.Name, pathOf(m)) then
+								P.addRow(m.Name, nil, {kind = "module", inst = m}, function(row) P.setDetail(moduleDetail(row.Data.inst)) end)
+								count = count + 1
+								if count >= CAP then break end
+							end
+						end
+					else
+						local list = {}
+						for _, d in ipairs(game:GetDescendants()) do
+							if d:IsA("BaseRemoteEvent") or d:IsA("RemoteFunction") then list[#list + 1] = d end
+						end
+						local gni = G("getnilinstances")
+						if gni then
+							local ok2, nils = pcall(gni)
+							if ok2 and type(nils) == "table" then
+								for _, d in ipairs(nils) do
+									if typeof(d) == "Instance" and (d:IsA("BaseRemoteEvent") or d:IsA("RemoteFunction")) then list[#list + 1] = d end
+								end
+							end
+						end
+						for idx, r in ipairs(list) do
+							if idx % 800 == 0 then task.wait() end
+							if matchesFilter(fl, r.Name, pathOf(r)) then
+								P.addRow("[" .. r.ClassName .. "] " .. r.Name, nil, {kind = "remote", inst = r},
+									function(row) P.setDetail(remoteDetailHydro(row.Data.inst)) end)
+								count = count + 1
+								if count >= CAP then break end
+							end
+						end
+					end
+					P.setDetail("-- " .. HYDRO_MODES[mode] .. " scan finished: " .. count .. " result(s)" .. (count >= CAP and " (capped)" or ""))
+				end)
+				Hydro.scanning = false
+				if not ok then P.setDetail("-- scan failed: " .. tostring(err)) end
+			end)
+		end
+
+		local function needData(kind)
+			local row = P.selected
+			if not row or not row.Data then P.setDetail("-- select a result first") return nil end
+			if kind and row.Data.kind ~= kind then P.setDetail("-- this action only works on " .. kind .. " results") return nil end
+			return row.Data
+		end
+
+		local buttons = {
+			{"Mode: Functions", 110, function(btn)
+				Hydro.mode = Hydro.mode % #HYDRO_MODES + 1
+				btn.Text = "Mode: " .. HYDRO_MODES[Hydro.mode]
+			end},
+			{"Scan", 52, scan},
+			{"Spy Closure", 84, function()
+				local d = needData() if not d then return end
+				local f = d.fn
+				if d.kind == "remote" then
+					local hs = remoteHandlers(d.inst)
+					f = hs[1] and hs[1].fn
+				end
+				if not f then P.setDetail("-- no Lua function available for this result") return end
+				local ok, res = hookClosure(f, fnName(f))
+				if ok then
+					P.setDetail("-- hooked " .. describeFn(f) .. "\n-- open the Closure Spy tab to watch its calls.")
+				else
+					P.setDetail("-- could not hook: " .. tostring(res))
+				end
+			end},
+			{"View Script", 80, function()
+				local d = needData() if not d then return end
+				local s = d.inst
+				if d.kind == "fn" then s = fnScript(d.fn) end
+				if typeof(s) == "Instance" and ScriptViewer then ScriptViewer.ViewScript(s)
+				else P.setDetail("-- no script available for this result") end
+			end},
+			{"Set Upvalue", 84, function()
+				local d = needData("fn") if not d then return end
+				local idx, expr = P.boxes.edit.Text:match("^%s*(%d+)%s*=%s*(.+)$")
+				if not idx then P.setDetail("-- type  <index> = <lua expr>  in the right box, e.g.  2 = 9999") return end
+				local sup = G("setupvalue") or (debug and debug.setupvalue)
+				if not sup then P.setDetail("-- executor lacks setupvalue") return end
+				local fn, err = compileExpr(expr)
+				if not fn then P.setDetail("-- bad expression: " .. tostring(err)) return end
+				local ok, v = pcall(fn)
+				if not ok then P.setDetail("-- expression error: " .. tostring(v)) return end
+				local ok2, e2 = pcall(sup, d.fn, tonumber(idx), v)
+				P.setDetail(ok2 and fnDetail(d.fn) or ("-- setupvalue failed: " .. tostring(e2)))
+			end},
+			{"Call", 46, function()
+				local d = needData("fn") if not d then return end
+				local fn, err = compileExpr("table.pack(" .. P.boxes.edit.Text .. ")")
+				if not fn then P.setDetail("-- bad arguments: " .. tostring(err)) return end
+				local ok, packed = pcall(fn)
+				if not ok then P.setDetail("-- argument error: " .. tostring(packed)) return end
+				local res = pack(pcall(d.fn, unpack(packed, 1, packed.n)))
+				local lines = {fnDetail(d.fn), "", "-- Call result: " .. (res[1] and "ok" or "ERROR")}
+				for i = 2, res.n do lines[#lines + 1] = "-- [" .. (i - 1) .. "] " .. oneLine(res[i], 300) end
+				P.setDetail(table.concat(lines, "\n"))
+			end},
+			{"Copy Info", 70, function() copyText(P.Detail.Text) end},
+			{"Clear", 52, function() P.clear() end},
+		}
+		P = makePanel({
+			name = "Hydroxide",
+			buttons = buttons,
+			boxes = {{"filter (name / path / string constant)", 200, "filter"}, {"edit: '2 = 123'  or  call args", 170, "edit"}},
+			hint = "-- Hydroxide: scan the game's memory.\n"
+				.. "--   Functions: getgc scan (filter also matches string constants + upvalues)\n"
+				.. "--   Scripts / Modules: getscripts / getloadedmodules + getsenv / require\n"
+				.. "--   Remotes: client handlers (getconnections) for every RemoteEvent / Function\n"
+				.. "-- Change the mode, optionally type a filter, press Scan.\n"
+				.. "-- Needs getgc / getconstants / getupvalues / getsenv / getconnections (varies per executor).",
+		})
+		Spies.HydroPanel = P
+		return P
+	end
+
 	---------------------------------------------------------------------
 	-- Hook Spy (who calls hookfunction / hookmetamethod / ... ?)
 	---------------------------------------------------------------------
@@ -17145,16 +15715,207 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 	end
 
 	---------------------------------------------------------------------
+	-- Utopia Spy (replaces the old SimpleSpy tab)
+	-- Same logic as the UtopiaSpy script: global __namecall hook + direct FireServer / InvokeServer
+	-- hooks, incoming OnClientEvent connections, ignore / block / blacklist-by-name.
+	---------------------------------------------------------------------
+	local Utopia = {
+		active = false, installed = false, incoming = true,
+		ignored = {}, blocked = {}, blacklistedNames = {},
+		cons = {}, descCon = nil, counter = 0,
+	}
+	local utopiaLog
+
+	-- [SPIES:UTOPIA-RECORD] one captured call -> Utopia tab (same table shape remoteDetail() expects)
+	local function utopiaRecord(dir, remote, method, args, script)
+		Utopia.counter = Utopia.counter + 1
+		local e = {
+			id = Utopia.counter, dir = dir, remote = remote, name = remote.Name, class = remote.ClassName,
+			method = method, args = args, clock = nowStr(), script = script, noReturn = true,
+		}
+		push(function() utopiaLog(e) end)
+	end
+
+	-- [SPIES:UTOPIA-HOOKS] installed once; the hooks stay in place and only act while Utopia.active is true
+	local function installUtopia()
+		if Utopia.installed then return true end
+		local hookmm, getnc = G("hookmetamethod"), G("getnamecallmethod")
+		if not (hookmm and getnc) then
+			return false, "executor lacks hookmetamethod / getnamecallmethod"
+		end
+		local hookf = G("hookfunction")
+		local setnc = G("setnamecallmethod")
+		local newcc = G("newcclosure") or function(f) return f end
+		local checkcaller = G("checkcaller") or function() return false end
+		local gcs = G("getcallingscript")
+		local lower, find = string.lower, string.find
+		local ign, blk, bl = Utopia.ignored, Utopia.blocked, Utopia.blacklistedNames
+
+		local function callingScript()
+			if not gcs then return nil end
+			local ok, s = pcall(gcs)
+			return ok and s or nil
+		end
+
+		-- __namecall: remote:FireServer(...) / remote:InvokeServer(...)
+		local oldNC
+		oldNC = hookmm(game, "__namecall", newcc(function(self, ...)
+			local method = getnc()
+			if Utopia.active and type(method) == "string" then
+				local lm = lower(method)
+				if lm == "invokeserver" or lm == "fireserver" then
+					local cn = self.ClassName
+					if (find(cn, "Event") or find(cn, "Function")) and not ign[self] and not bl[self.Name] then
+						if not checkcaller() and blk[self] then return end
+						utopiaRecord("out", self, method, pack(...), callingScript())
+					end
+				end
+			end
+			if setnc and type(method) == "string" then setnc(method) end
+			return oldNC(self, ...)
+		end))
+
+		-- direct form: remote.FireServer(remote, ...)
+		if hookf then
+			local function hookDirect(className, method)
+				local ok, err = pcall(function()
+					local oldF
+					oldF = hookf(Instance.new(className)[method], function(self, ...)
+						if Utopia.active and not ign[self] then
+							if not checkcaller() and blk[self] then return end
+							utopiaRecord("out", self, method, pack(...), callingScript())
+						end
+						return oldF(self, ...)
+					end)
+				end)
+				if not ok then warn("[BAD DEX Spies] Utopia direct hook " .. className .. "." .. method .. " failed: " .. tostring(err)) end
+			end
+			hookDirect("RemoteEvent", "FireServer")
+			hookDirect("RemoteFunction", "InvokeServer")
+		end
+
+		Utopia.installed = true
+		startQueue()
+		return true
+	end
+
+	-- [SPIES:UTOPIA-INCOMING] server -> client: RemoteEvent.OnClientEvent (+ OnClientInvoke where supported)
+	local function utopiaConnect(r)
+		local cn = r.ClassName
+		if cn == "RemoteEvent" then
+			Utopia.cons[#Utopia.cons + 1] = r.OnClientEvent:Connect(function(...)
+				if Utopia.active and Utopia.incoming and not Utopia.ignored[r] then
+					utopiaRecord("in", r, "OnClientEvent", pack(...))
+				end
+			end)
+		elseif cn == "RemoteFunction" then
+			-- [SPIES:UTOPIA-INVOKECLIENT] UtopiaSpy only hooks OnClientInvoke when syn.toast_notification exists
+			-- (Synapse). Same condition here; add logging by hooking getcallbackmember(r, "OnClientInvoke").
+		end
+	end
+
+	local function utopiaStart()
+		for _, d in ipairs(game:GetDescendants()) do utopiaConnect(d) end
+		Utopia.descCon = game.DescendantAdded:Connect(utopiaConnect)
+	end
+
+	local function utopiaStop()
+		for i = #Utopia.cons, 1, -1 do
+			pcall(function() Utopia.cons[i]:Disconnect() end)
+			Utopia.cons[i] = nil
+		end
+		if Utopia.descCon then Utopia.descCon:Disconnect() Utopia.descCon = nil end
+	end
+
+	local function buildUtopiaPanel()
+		local P
+		local function sel()
+			local row = P.selected
+			if not row or not row.Data then P.setDetail("-- select a call first") return nil end
+			return row.Data
+		end
+		local buttons = {
+			{"Enable: OFF", 84, function(btn)
+				if not Utopia.active then
+					local ok, err = installUtopia()
+					if not ok then P.setDetail("-- cannot enable: " .. tostring(err)) return end
+					Utopia.active = true
+					if Utopia.incoming then utopiaStart() end
+				else
+					Utopia.active = false
+					utopiaStop()
+				end
+				btn.Text = toggleText("Enable", Utopia.active)
+			end},
+			{"Incoming: ON", 86, function(btn)
+				Utopia.incoming = not Utopia.incoming
+				if Utopia.active then
+					if Utopia.incoming then utopiaStart() else utopiaStop() end
+				end
+				btn.Text = toggleText("Incoming", Utopia.incoming)
+			end},
+			{"Copy Code", 70, function()
+				local e = sel() if not e then return end
+				if not copyText(genRemoteCode(e)) then P.setDetail("-- executor has no setclipboard; copy the code from this box\n\n" .. genRemoteCode(e)) end
+			end},
+			{"Run", 46, function()
+				local e = sel() if not e then return end
+				replayRemote(e)
+			end},
+			{"Copy Path", 70, function()
+				local e = sel() if not e then return end
+				copyText(pathOf(e.remote))
+			end},
+			{"Ignore", 56, function()
+				local e = sel() if not e then return end
+				Utopia.ignored[e.remote] = true
+				P.setDetail("-- ignoring " .. e.name .. " (Reset to undo)")
+			end},
+			{"Block", 52, function()
+				local e = sel() if not e then return end
+				Utopia.blocked[e.remote] = not Utopia.blocked[e.remote] or nil
+				P.setDetail("-- " .. e.name .. (Utopia.blocked[e.remote] and " is now BLOCKED (calls are dropped client-side, not logged)" or " is no longer blocked"))
+			end},
+			{"Blacklist Name", 96, function()
+				local e = sel() if not e then return end
+				Utopia.blacklistedNames[e.name] = true
+				P.setDetail("-- every remote named '" .. e.name .. "' is now ignored (Reset to undo)")
+			end},
+			{"Reset", 52, function()
+				table.clear(Utopia.ignored)
+				table.clear(Utopia.blocked)
+				table.clear(Utopia.blacklistedNames)
+				P.setDetail("-- cleared ignored / blocked / blacklisted lists")
+			end},
+			{"Clear", 52, function() P.clear() end},
+		}
+		P = makePanel({
+			name = "Utopia",
+			buttons = buttons,
+			hint = "-- Utopia Spy: remote spy built on the UtopiaSpy logic.\n"
+				.. "-- Press Enable, then do something in the game. Click a call to see the generated code.\n"
+				.. "-- Outgoing (blue): FireServer / InvokeServer.  Incoming (green): OnClientEvent.\n"
+				.. "-- Block drops the call client-side. Ignore / Blacklist Name hide a remote (or every remote with that name).\n"
+				.. "-- Needs hookmetamethod + getnamecallmethod (hookfunction, getcallingscript, firesignal improve it).",
+		})
+		Spies.UtopiaPanel = P
+		utopiaLog = function(e)
+			P.addRow(remoteRowText(e), e.dir == "in" and COL_IN or COL_OUT, e, function(row)
+				P.setDetail(remoteDetail(row.Data, false))
+			end)
+		end
+		return P
+	end
+
+	---------------------------------------------------------------------
 	-- Originals (load the real tools from their official repos)
 	---------------------------------------------------------------------
 	local HYDRO_BASE = "https://raw.githubusercontent.com/Upbolt/Hydroxide/revision/%s.lua"
-	-- [SPIES:ORIGINALS] add more official scripts here: {id = "Name", url = "raw url", note = "...", overrides = {...}}
+	-- [SPIES:ORIGINALS] add more official scripts here: {id = "Name", url = "raw url", note = "..."}  or  {id = "Name", source = "<lua code>", note = "..."}
 	-- Each entry automatically gets a "Load <id>" button in the Originals tab.
 	local ORIGINALS = {
-		-- UtopiaSpy: the full original script is embedded in this file (UTOPIA_SRC, search [SPIES:UTOPIA-SRC]),
-		-- so it needs no download and runs exactly as supplied.
 		{id = "UtopiaSpy", source = UTOPIA_SRC,
-			note = "UtopiaSpy (Made by UtopiaTM) - embedded copy, runs as-is; its own window opens separately (RightAlt = minimise)"},
+			note = "UtopiaSpy (embedded in this file, nothing is downloaded)"},
 		{id = "Cobalt", url = "https://github.com/notpoiu/cobalt/releases/latest/download/Cobalt.luau",
 			note = "Cobalt by notpoiu - latest release (loader URL taken from the official Cobalt docs). If it says 'HTML page', your executor's HttpGet is not following GitHub's release redirect: download Cobalt.luau yourself, host it somewhere raw, paste that URL into the box and press 'Load URL'."},
 	}
@@ -17189,7 +15950,7 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 
 	-- overrides = optional table of globals the loaded script sees instead of the real ones
 	-- (everything else falls through to getgenv()); used below to adapt old scripts to new executors
-	local function runChunk(body, chunk, overrides)
+	local function loadSource(body, chunk, overrides)
 		local ls = G("loadstring") or loadstring
 		if not ls then return false, "executor lacks loadstring" end
 		local fn, err = ls(body, "=" .. chunk)
@@ -17214,7 +15975,7 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 	local function loadRemote(url, chunk, overrides)
 		local ok, body = httpGet(url)
 		if not ok then return false, "download failed: " .. tostring(body) end
-		return runChunk(body, chunk, overrides)
+		return loadSource(body, chunk, overrides)
 	end
 
 	local function buildOriginalsPanel()
@@ -17238,7 +15999,11 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 					local ov = o.overrides
 					if type(ov) == "function" then ov = ov() end
 					local ok, info
-					if o.source then ok, info = runChunk(o.source, o.id, ov) else ok, info = loadRemote(o.url, o.id, ov) end
+					if o.source then
+						ok, info = loadSource(o.source, o.id, ov)
+					else
+						ok, info = loadRemote(o.url, o.id, ov)
+					end
 					if not ok then error(info, 0) end
 					return o.id .. " loaded (" .. info .. " bytes)\n-- " .. o.note
 				end)
@@ -17262,25 +16027,21 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 				return "loaded " .. info .. " bytes"
 			end)
 		end}
-		buttons[#buttons + 1] = {"Skidnet jelly windows: ON", 140, function(btn)
-			Lib.Skin.Enabled = not Lib.Skin.Enabled
-			btn.Text = "Skidnet jelly windows: " .. (Lib.Skin.Enabled and "ON" or "OFF")
-		end, function(btn) btn.Text = "Skidnet jelly windows: " .. (Lib.Skin.Enabled and "ON" or "OFF") end}
 		P = makePanel({
 			name = "Originals",
 			buttons = buttons,
 			boxes = {{"raw script URL (for Load URL)", 260, "url"}},
 			hint = "-- Originals: runs the real, unmodified tools straight from their official repositories\n"
-				.. "-- (downloaded ones are always the newest version; UtopiaSpy is embedded in this file).\n"
+				.. "-- (always the newest version, nothing copied into this file).\n"
 				.. "--\n"
-				.. "--   UtopiaSpy   embedded original script (no download needed)\n"
+				.. "--   UtopiaSpy   the code you gave me, embedded in this file (no download)\n"
 				.. "--   Hydroxide   Upbolt/Hydroxide (revision) - its own Remote Spy, Closure Spy,\n"
 				.. "--               Upvalue / Constant / Script / Module scanners\n"
 				.. "--   Cobalt      notpoiu/cobalt - latest release (loader URL from the official docs)\n"
 				.. "--   Load URL    any other raw script you paste into the box\n"
 				.. "--\n"
-				.. "-- Needs an executor with loadstring (+ HttpGet or request for the downloaded ones).\n"
-				.. "-- The tabs in this window (UtopiaSpy, Cobalt, Hydroxide, ...) are BAD DEX's own\n"
+				.. "-- Needs an executor with loadstring + HttpGet (or request).\n"
+				.. "-- The tabs in this window (Utopia, Cobalt, Hydroxide, ...) are BAD DEX's own\n"
 				.. "-- lightweight versions that live inside Dex.",
 		})
 		Spies.OriginalsPanel = P
@@ -17316,7 +16077,7 @@ r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
 		body.Parent = content
 
 		-- [SPIES:TABS] add or reorder tabs here: addTab("Name", buildFn) (tab buttons share the width evenly)
-		addTab("UtopiaSpy", function() return buildRemotePanel("simple") end)
+		addTab("Utopia", buildUtopiaPanel)
 		addTab("Cobalt", function() return buildRemotePanel("cobalt") end)
 		addTab("Hydroxide", buildHydroPanel)
 		addTab("Closure Spy", buildClosurePanel)
@@ -20809,49 +19570,49 @@ DefaultSettings = (function()
 			MaxAttributes = 50,
 			ScaleType = 0 -- 0 Full Name Shown, 1 Equal Halves
 		},
-		Theme = { -- [SKIN:THEME] Liquid Glass palette (same family as the Skidnet script)
+		Theme = {
 			_Recurse = true,
-			Main1 = rgb(16,20,28),
-			Main2 = rgb(11,14,20),
-			Outline1 = rgb(8,10,14),
-			Outline2 = rgb(48,58,74),
-			Outline3 = rgb(6,8,11),
-			TextBox = rgb(14,18,25),
-			Menu = rgb(13,17,24),
-			ListSelection = rgb(61,174,233),
-			Button = rgb(30,38,52),
-			ButtonHover = rgb(42,52,70),
-			ButtonPress = rgb(22,28,39),
-			Highlight = rgb(61,174,233),
-			Text = rgb(255,255,255),
-			PlaceholderText = rgb(120,130,146),
-			Important = rgb(255,95,87),
+			Main1 = rgb(30,20,22),
+			Main2 = rgb(23,15,17),
+			Outline1 = rgb(14,9,10),
+			Outline2 = rgb(56,34,38),
+			Outline3 = rgb(12,8,9),
+			TextBox = rgb(26,17,19),
+			Menu = rgb(24,15,17),
+			ListSelection = rgb(200,50,60),
+			Button = rgb(46,28,31),
+			ButtonHover = rgb(62,37,41),
+			ButtonPress = rgb(34,21,23),
+			Highlight = rgb(200,50,60),
+			Text = rgb(236,230,231),
+			PlaceholderText = rgb(120,100,102),
+			Important = rgb(255,90,90),
 			ExplorerIconMap = "",
 			MiscIconMap = "",
 			Syntax = {
-				Text = rgb(222,228,236),
-				Background = rgb(12,15,21),
+				Text = rgb(214,206,208),
+				Background = rgb(20,13,15),
 				Selection = rgb(255,255,255),
-				SelectionBack = rgb(34,78,110),
-				Operator = rgb(205,213,224),
-				Number = rgb(255,196,120),
-				String = rgb(150,215,160),
-				Comment = rgb(110,122,140),
-				Keyword = rgb(90,190,245),
-				Error = rgb(255,95,87),
-				FindBackground = rgb(110,80,0),
-				MatchingWord = rgb(40,52,70),
-				BuiltIn = rgb(120,215,250),
-				CurrentLine = rgb(24,31,43),
-				LocalMethod = rgb(255,226,150),
-				LocalProperty = rgb(160,200,250),
-				Nil = rgb(255,196,120),
-				Bool = rgb(255,196,120),
-				Function = rgb(90,190,245),
-				Local = rgb(90,190,245),
-				Self = rgb(255,196,120),
-				FunctionName = rgb(255,226,150),
-				Bracket = rgb(205,213,224)
+				SelectionBack = rgb(90,40,46),
+				Operator = rgb(210,200,202),
+				Number = rgb(240,170,90),
+				String = rgb(150,215,140),
+				Comment = rgb(120,105,108),
+				Keyword = rgb(240,90,110),
+				Error = rgb(255,80,80),
+				FindBackground = rgb(120,70,0),
+				MatchingWord = rgb(70,50,54),
+				BuiltIn = rgb(120,200,250),
+				CurrentLine = rgb(40,24,27),
+				LocalMethod = rgb(240,220,140),
+				LocalProperty = rgb(230,140,150),
+				Nil = rgb(240,170,90),
+				Bool = rgb(240,170,90),
+				Function = rgb(240,90,110),
+				Local = rgb(240,90,110),
+				Self = rgb(240,170,90),
+				FunctionName = rgb(240,220,140),
+				Bracket = rgb(210,200,202)
 			},
 		},
 		ScriptViewer = {
@@ -33277,15 +32038,6 @@ return __M["main"]
 
 		local openButton = gui.OpenButton
 		openButton.BackgroundTransparency = 0.2
-		pcall(function() -- [SKIN:LAUNCHER] glass pill launcher (RightCtrl hides it together with the windows)
-			openButton.BackgroundColor3 = Color3.fromRGB(10,12,16)
-			openButton.UICorner.CornerRadius = UDim.new(0,16)
-			openButton.MainFrame.UICorner.CornerRadius = UDim.new(0,14)
-			local __st = Instance.new("UIStroke")
-			__st.Color, __st.Thickness, __st.Transparency, __st.ApplyStrokeMode = Color3.new(1,1,1), 1, 0.35, Enum.ApplyStrokeMode.Border
-			__st.Parent = openButton
-			pcall(function() openButton.FontFace = Font.new("rbxasset://fonts/families/Roboto.json", Enum.FontWeight.Medium) end)
-		end)
 		openButton.MainFrame.Size = UDim2.new(0,0,0,0)
 		openButton.MainFrame.Visible = false
 		openButton.MouseButton1Click:Connect(function()
