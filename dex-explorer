@@ -6093,119 +6093,1082 @@ local function main()
 		return {new = new}
 	end)()
 
-	-- Wobbly windows: spring physics (position + swing + squash) for dragged windows.
-	-- Roblox GUI can't be mesh-deformed like Compiz, so the window hangs from the grab point
-	-- on a spring: it lags behind the cursor, swings around the grab point and jiggles to rest.
-	Lib.Wobbly = (function()
-		local W = {
-			Enabled = true,
-			Stiffness = 230,   -- follow spring (higher = tighter)
-			Damping = 18,      -- higher = less jelly
-			SwingStiffness = 150,
-			SwingDamping = 6.5,
-			-- Roblox turns ClipsDescendants OFF for rotated GUI objects, which made text leak out of
-			-- the window. Tilt is therefore disabled by default (0); raise MaxTilt/Tilt only if you
-			-- accept unclipped content while a window is moving.
-			Tilt = 0,
-			MaxTilt = 0,
-			Squash = 0.00003,  -- extra scale per px/s of speed
-			MaxSquash = 0.02,
-		}
-		local states = {}
-		local conn
+	---------------------------------------------------------------------------------------------------
+	-- Lib.Skin  -  Skidnet window engine inside Dex
+	--
+	-- Port of the Skidnet script: every floating Dex window gets
+	--   * a background rasterised into a 2x EditableImage (anti-aliased rounded rect + glass rim)
+	--     drawn on an EditableMesh sheet inside a ViewportFrame behind the window,
+	--   * KWin "wobbly windows" physics (spring grid, grab constraint, edge collisions),
+	--   * a Liquid Glass MeshPart in front of the camera that follows the same deformation,
+	--   * macOS traffic-light buttons (close / minimise / centre) and a Roboto title,
+	-- and RightCtrl collapses everything into the Skidnet watermark pill (nick / FPS / ping).
+	--
+	-- The window CONTENT (Explorer tree, Properties, editor, ...) is made of live Instances, so it
+	-- cannot be baked into the texture like Skidnet's own rows: it rides rigidly on the centre of the
+	-- jelly while the glass behind it deforms. Without EditableMesh/EditableImage support (or when
+	-- Skin.Enabled = false) windows keep the same look as plain rounded glass frames (no wobble).
+	--
+	-- Search for [SKIN:...] markers to find the tunable parts.
+	---------------------------------------------------------------------------------------------------
+	Lib.Skin = (function()
+		local Skin = {Enabled = true, Hidden = false, Supported = nil, UseGlass = true}
+		local floor, ceil, clamp, sqrt, abs, max, min, exp, sin =
+			math.floor, math.ceil, math.clamp, math.sqrt, math.abs, math.max, math.min, math.exp, math.sin
+		local UIS = game:GetService("UserInputService")
+		local RunService = game:GetService("RunService")
+		local GuiService = game:GetService("GuiService")
+		local AssetService = game:GetService("AssetService")
+		local TweenService = game:GetService("TweenService")
+		local Players = game:GetService("Players")
+		local fromOffset = UDim2.fromOffset
 
-		local function finalize(gui, st)
-			states[gui] = nil
-			if st.scale then st.scale.Scale = 1 end
-			gui.Rotation = 0
-			gui.AnchorPoint = Vector2.new(0, 0)
-			gui.Position = UDim2.new(0, st.px - st.gx * st.sx, 0, st.py - st.gy * st.sy)
-			if next(states) == nil and conn then conn:Disconnect() conn = nil end
+		-- [SKIN:CONFIG] physics + look (values taken from Skidnet's WobblyWindows4 preset)
+		local CFG = {
+			stiffness = 240, damping = 1.8, grab = 2000, grid = {10, 8},
+			collide = true, restitution = 0, jellyClick = true,
+			radius = 16, bgAlpha = 0.22, rim = 0.80,
+			glassTransp = 0.55, refract = 0.70, reflect = 0.15, tint = {255, 255, 255},
+		}
+		Skin.CFG = CFG
+		-- [SKIN:COLORS] Liquid Glass (dark)
+		local ST = {
+			bg = {10, 12, 16}, text = {255, 255, 255}, dim = {222, 228, 236},
+			accent = {61, 174, 233}, close = {255, 95, 87}, min = {254, 188, 46}, center = {40, 200, 64},
+		}
+		Skin.ST = ST
+		local SS = 2                 -- texture supersampling
+		local MG = 4                 -- transparent margin around the window (anti-aliased edge)
+		local RX, RY = 36, 24        -- window mesh resolution
+		local GRX, GRY = 28, 20      -- glass mesh resolution
+		local MAX_H = 1 / 360
+		local DG = 1
+		local PX, PY = CFG.grid[1], CFG.grid[2]
+		local NN = PX * PY
+		local BAR_H = 20             -- Dex title bar height
+		local FONT_MED
+		pcall(function() FONT_MED = Font.new("rbxasset://fonts/families/Roboto.json", Enum.FontWeight.Medium) end)
+
+		local hasBuffer = type(buffer) == "table" and buffer.create ~= nil
+		local rd8, wr8, wr32, bcopy
+		if hasBuffer then rd8, wr8, wr32, bcopy = buffer.readu8, buffer.writeu8, buffer.writeu32, buffer.copy end
+
+		local rigs = {}          -- window -> rig
+		local rigList = {}
+		local useAlpha = false
+		local cam
+		local V = {x = 0, y = 0, insetY = 0, fov = 0, tanH = 1}
+		local lastTouch
+		local conns = {}
+
+		---------------------------------------------------------------- capability check
+		local function trySA()
+			local sa = Instance.new("SurfaceAppearance")
+			local ok = pcall(function() sa.AlphaMode = Enum.AlphaMode.Transparency end)
+			if not ok and typeof(sethiddenproperty) == "function" then
+				ok = pcall(sethiddenproperty, sa, "AlphaMode", Enum.AlphaMode.Transparency)
+			end
+			if ok and sa.AlphaMode == Enum.AlphaMode.Transparency then return sa end
+			sa:Destroy()
+			return nil
 		end
 
-		local function step(dt)
-			if dt > 1 / 20 then dt = 1 / 20 end
-			local subs = 3
-			local h = dt / subs
-			for gui, st in pairs(states) do
-				if not gui.Parent then
-					states[gui] = nil
-				else
-					for _ = 1, subs do
-						st.vx = st.vx + (-W.Stiffness * (st.px - st.tx) - W.Damping * st.vx) * h
-						st.vy = st.vy + (-W.Stiffness * (st.py - st.ty) - W.Damping * st.vy) * h
-						st.px = st.px + st.vx * h
-						st.py = st.py + st.vy * h
-						local target = st.vx * W.Tilt
-						if target > W.MaxTilt then target = W.MaxTilt elseif target < -W.MaxTilt then target = -W.MaxTilt end
-						st.vr = st.vr + (-W.SwingStiffness * (st.rot - target) - W.SwingDamping * st.vr) * h
-						st.rot = st.rot + st.vr * h
+		local function checkSupport()
+			if Skin.Supported ~= nil then return Skin.Supported end
+			Skin.Supported = false
+			if not hasBuffer then return false end
+			local ok = pcall(function()
+				local img = AssetService:CreateEditableImage({Size = Vector2.new(4, 4)})
+				img:Destroy()
+				local em = AssetService:CreateEditableMesh()
+				em:Destroy()
+				assert(Content and Content.fromObject)
+			end)
+			if not ok then return false end
+			local t = trySA()
+			if t then useAlpha = true t:Destroy() end
+			if not useAlpha then CFG.radius = 0 end -- no per-pixel alpha: square corners, like Skidnet
+			Skin.Supported = true
+			return true
+		end
+
+		---------------------------------------------------------------- helpers
+		local function smooth(e0, e1, x)
+			local t = clamp((x - e0) / (e1 - e0), 0, 1)
+			return t * t * (3 - 2 * t)
+		end
+		local function sdRound(px, py, x, y, w, h, r)
+			local qx = abs(px - (x + w * 0.5)) - (w * 0.5 - r)
+			local qy = abs(py - (y + h * 0.5)) - (h * 0.5 - r)
+			local ox, oy = max(qx, 0), max(qy, 0)
+			return sqrt(ox * ox + oy * oy) + min(max(qx, qy), 0) - r
+		end
+		local function C3(c) return Color3.fromRGB(c[1], c[2], c[3]) end
+
+		---------------------------------------------------------------- rasteriser
+		local function fillSpan32(R, o, n, val)
+			if n <= 0 then return end
+			wr32(R.canvas, o, val)
+			local done = 1
+			while done < n do
+				local c = min(done, n - done)
+				bcopy(R.canvas, o + done * 4, R.canvas, o, c * 4)
+				done = done + c
+			end
+		end
+
+		-- [SKIN:BACKGROUND] the window texture: translucent dark body + white glass rim, transparent outside
+		local function drawBackground(R)
+			local TXW, TXH, WW, WH = R.TXW, R.TXH, R.WW, R.WH
+			local canvas = R.canvas
+			local rad = CFG.radius * SS
+			local rim = useAlpha and CFG.rim or 0
+			local bga = useAlpha and CFG.bgAlpha or 1
+			local bg = ST.bg
+			local x0, y0, w, h = MG * SS, MG * SS, WW * SS, WH * SS
+			local band = floor((max(CFG.radius, 16) + MG) * SS + 2)
+			if band * 2 > TXW then band = floor(TXW / 2) end
+			for py = 0, TXH - 1 do
+				if py % 24 == 23 then task.wait() end -- the texture is big: do not freeze the game while painting it
+				local fy = py + 0.5
+				local yn = clamp((py - y0) / h, 0, 1)
+				local sheen = (1 - yn) ^ 3 * 0.10 * rim
+				local r, g, b, a = bg[1], bg[2], bg[3], bga
+				if sheen > 0 then
+					local na = a + sheen * (1 - a)
+					r = (r * a * (1 - sheen) + 255 * sheen) / na
+					g = (g * a * (1 - sheen) + 255 * sheen) / na
+					b = (b * a * (1 - sheen) + 255 * sheen) / na
+					a = na
+				end
+				local inner = floor(r + 0.5) + floor(g + 0.5) * 256 + floor(b + 0.5) * 65536 + floor(a * 255 + 0.5) * 16777216
+				local rowO = py * TXW * 4
+				local edgeRow = py < band or py >= TXH - band
+				local function edgePx(pxx)
+					local o = rowO + pxx * 4
+					local d = sdRound(pxx + 0.5, fy, x0, y0, w, h, rad)
+					local cov = 0.5 - d
+					if cov <= 0 then wr32(canvas, o, 0) return end
+					if cov > 1 then cov = 1 end
+					local R_, G_, B_, A_ = r, g, b, a
+					local e = -d / SS
+					local nx, ny = (pxx - x0) / w * 2 - 1, yn * 2 - 1
+					local dir = 0.3 + 0.7 * abs((-nx - ny) * 0.5)
+					local line = clamp(1 - e / 1.6, 0, 1)
+					local glow = 1 - clamp(e / 14, 0, 1)
+					local wa = clamp(rim * (line * 0.95 * dir + glow * glow * 0.20 * dir), 0, 1)
+					if wa > 0 then
+						local na = A_ + wa * (1 - A_)
+						R_ = (R_ * A_ * (1 - wa) + 255 * wa) / na
+						G_ = (G_ * A_ * (1 - wa) + 255 * wa) / na
+						B_ = (B_ * A_ * (1 - wa) + 255 * wa) / na
+						A_ = na
 					end
-					local speed = math.sqrt(st.vx * st.vx + st.vy * st.vy)
-					local sq = speed * W.Squash
-					if sq > W.MaxSquash then sq = W.MaxSquash end
-					st.sc = st.sc + (1 + sq - st.sc) * math.min(1, dt * 14)
-					gui.Position = UDim2.new(0, st.px, 0, st.py)
-					gui.Rotation = st.rot
-					if st.scale then st.scale.Scale = st.sc end
-					if not st.held and math.abs(st.px - st.tx) < 0.3 and math.abs(st.py - st.ty) < 0.3
-						and math.abs(st.vx) < 3 and math.abs(st.vy) < 3 and math.abs(st.rot) < 0.05 and math.abs(st.vr) < 0.4 then
-						finalize(gui, st)
+					wr32(canvas, o, floor(R_ + 0.5) + floor(G_ + 0.5) * 256 + floor(B_ + 0.5) * 65536 + floor(A_ * cov * 255 + 0.5) * 16777216)
+				end
+				if edgeRow then
+					for pxx = 0, TXW - 1 do edgePx(pxx) end
+				else
+					for pxx = 0, band - 1 do edgePx(pxx) end
+					fillSpan32(R, rowO + band * 4, TXW - 2 * band, inner)
+					for pxx = TXW - band, TXW - 1 do edgePx(pxx) end
+				end
+			end
+		end
+
+		---------------------------------------------------------------- meshes
+		local function anchors(em)
+			local L, uv0 = 8, em:AddUV(Vector2.new(0, 0))
+			local function tri(p1, p2, p3)
+				local f = em:AddTriangle(em:AddVertex(p1), em:AddVertex(p2), em:AddVertex(p3))
+				em:SetFaceUVs(f, {uv0, uv0, uv0})
+			end
+			tri(Vector3.new(-L, -L, L), Vector3.new(L, -L, L), Vector3.new(L, L, L))
+			tri(Vector3.new(0, 0, -L), Vector3.new(1e-4, 0, -L), Vector3.new(0, 1e-4, -L))
+		end
+
+		-- topology only; rest coordinates (us / vs) are filled by layoutSheet for the current window size
+		local function newSheet(nx, ny, glass)
+			local em = AssetService:CreateEditableMesh()
+			local n1 = nx + 1
+			local vids, uvs, nF, nB, ss, tt = {}, {}, {}, {}, {}, {}
+			for j = 0, ny do
+				for i = 0, nx do
+					local k = j * n1 + i + 1
+					local s, t = i / nx, j / ny
+					if glass then
+						s = s - 0.8 * sin(2 * math.pi * s) / (2 * math.pi)
+						t = t - 0.8 * sin(2 * math.pi * t) / (2 * math.pi)
+					end
+					ss[k], tt[k] = s, t
+					vids[k] = em:AddVertex(Vector3.new(0, 0, -1))
+					uvs[k] = em:AddUV(Vector2.new(i / nx, j / ny))
+					if glass then
+						nF[k] = em:AddNormal(Vector3.new(0, 0, 1))
+						nB[k] = em:AddNormal(Vector3.new(0, 0, -1))
+					end
+				end
+			end
+			local function tri(a, b, c, nt)
+				local f = em:AddTriangle(vids[a], vids[b], vids[c])
+				em:SetFaceUVs(f, {uvs[a], uvs[b], uvs[c]})
+				if nt then em:SetFaceNormals(f, {nt[a], nt[b], nt[c]}) end
+			end
+			for j = 0, ny - 1 do
+				for i = 0, nx - 1 do
+					local a = j * n1 + i + 1
+					local b, c = a + 1, a + n1
+					local d = c + 1
+					tri(a, c, b, glass and nF); tri(b, c, d, glass and nF)
+					tri(a, b, c, glass and nB); tri(b, d, c, glass and nB)
+				end
+			end
+			anchors(em)
+			return {em = em, vids = vids, nF = nF, nB = nB, ss = ss, tt = tt, us = {}, vs = {}, n = n1 * (ny + 1), glass = glass}
+		end
+
+		local function layoutSheet(sheet, WW, WH)
+			for k = 1, sheet.n do
+				if sheet.glass then
+					sheet.us[k], sheet.vs[k] = sheet.ss[k] * WW, sheet.tt[k] * WH
+				else
+					sheet.us[k], sheet.vs[k] = -MG + sheet.ss[k] * (WW + 2 * MG), -MG + sheet.tt[k] * (WH + 2 * MG)
+				end
+			end
+		end
+
+		local function sheetPart(sheet)
+			local mp = AssetService:CreateMeshPartAsync(Content.fromObject(sheet.em), {CollisionFidelity = Enum.CollisionFidelity.Box})
+			mp.Anchored = true
+			mp.CanCollide = false
+			pcall(function() mp.CanQuery = false; mp.CanTouch = false end)
+			mp.CastShadow = false
+			pcall(function() mp.Size = mp.MeshSize end)
+			mp.CFrame = CFrame.new()
+			return mp
+		end
+
+		---------------------------------------------------------------- spring grid physics (KWin style)
+		-- Catmull-Rom weights from the PX x PY node grid to any mesh vertex
+		local function cr1D(f, np)
+			local i = clamp(floor(f), 0, np - 2)
+			local t = f - i
+			local t2, t3 = t * t, t * t * t
+			local w = {(-t3 + 2 * t2 - t) / 2, (3 * t3 - 5 * t2 + 2) / 2, (-3 * t3 + 4 * t2 + t) / 2, (t3 - t2) / 2}
+			local acc = {}
+			for q = 0, 3 do
+				local id, ww = i - 1 + q, w[q + 1]
+				if id < 0 then acc[0] = (acc[0] or 0) + 2 * ww; acc[1] = (acc[1] or 0) - ww
+				elseif id > np - 1 then acc[np - 1] = (acc[np - 1] or 0) + 2 * ww; acc[np - 2] = (acc[np - 2] or 0) - ww
+				else acc[id] = (acc[id] or 0) + ww end
+			end
+			local out = {}
+			for id, ww in pairs(acc) do table.insert(out, {id, ww}) end
+			return out
+		end
+
+		local function buildWeights(WW, WH, us, vs, n)
+			local WI, WV = table.create(n * 16, 1), table.create(n * 16, 0)
+			for k = 1, n do
+				local xs = cr1D(us[k] / WW * (PX - 1), PX)
+				local ys = cr1D(vs[k] / WH * (PY - 1), PY)
+				local o, s = (k - 1) * 16, 0
+				for _, xa in ipairs(xs) do
+					for _, ya in ipairs(ys) do
+						s = s + 1
+						WI[o + s] = ya[1] * PX + xa[1] + 1
+						WV[o + s] = xa[2] * ya[2]
+					end
+				end
+			end
+			return {WI, WV, n}
+		end
+
+		local function evalList(R, wt, outX, outY)
+			local WI, WV, n = wt[1], wt[2], wt[3]
+			local px, py = R.px, R.py
+			for k = 1, n do
+				local o, x, y = (k - 1) * 16, 0, 0
+				for s = 1, 16 do
+					local w = WV[o + s]
+					if w ~= 0 then
+						local id = WI[o + s]
+						x = x + w * px[id]; y = y + w * py[id]
+					end
+				end
+				outX[k], outY[k] = x, y
+			end
+		end
+
+		local function initNodes(R)
+			local WW, WH = R.WW, R.WH
+			R.rx, R.ry, R.px, R.py, R.vx, R.vy, R.ax, R.ay = {}, {}, {}, {}, {}, {}, {}, {}
+			R.edges = {}
+			for j = 0, PY - 1 do
+				for i = 0, PX - 1 do
+					local n = j * PX + i + 1
+					R.rx[n], R.ry[n] = i * WW / (PX - 1), j * WH / (PY - 1)
+					R.px[n], R.py[n], R.vx[n], R.vy[n], R.ax[n], R.ay[n] = R.rx[n], R.ry[n], 0, 0, 0, 0
+				end
+			end
+			local rx, ry = R.rx, R.ry
+			local function edge(a, b, w)
+				local dx, dy = rx[b] - rx[a], ry[b] - ry[a]
+				local lim = sqrt(dx * dx + dy * dy) * 0.32
+				table.insert(R.edges, {a, b, dx, dy, w, 1 / (lim * lim)})
+			end
+			for j = 0, PY - 1 do
+				for i = 0, PX - 1 do
+					local n = j * PX + i + 1
+					if i < PX - 1 then edge(n, n + 1, 1) end
+					if j < PY - 1 then edge(n, n + PX, 1) end
+					if i < PX - 1 and j < PY - 1 then
+						edge(n, n + PX + 1, 0.5)
+						edge(n + 1, n + PX, 0.5)
 					end
 				end
 			end
 		end
 
-		-- grab point offset (offX, offY) in px from the window's top-left
-		function W.Begin(gui, offX, offY)
-			if not W.Enabled then return false end
-			local old = states[gui]
-			if old then finalize(gui, old) end
-			local abs, size = gui.AbsolutePosition, gui.AbsoluteSize
-			if size.X < 1 or size.Y < 1 then return false end
-			local gx, gy = offX / size.X, offY / size.Y
-			local scale = gui:FindFirstChild("WobbleScale")
-			if not scale then
-				scale = Instance.new("UIScale")
-				scale.Name = "WobbleScale"
-				scale.Parent = gui
+		local function resetNodes(R)
+			for n = 1, NN do R.px[n], R.py[n], R.vx[n], R.vy[n] = R.winX + R.rx[n], R.winY + R.ry[n], 0, 0 end
+		end
+
+		local function physicsStep(R, h)
+			local k, c = CFG.stiffness, CFG.damping
+			local px, py, vx, vy, ax, ay, rx, ry = R.px, R.py, R.vx, R.vy, R.ax, R.ay, R.rx, R.ry
+			for n = 1, NN do ax[n] = 0; ay[n] = 0 end
+			for _, e in ipairs(R.edges) do
+				local a, b = e[1], e[2]
+				local dx = (px[b] - px[a]) - e[3]
+				local dy = (py[b] - py[a]) - e[4]
+				local m = (dx * dx + dy * dy) * e[6]
+				if m > 8 then m = 8 end
+				local kw = k * e[5] * (1 + m)
+				ax[a] = ax[a] + dx * kw; ay[a] = ay[a] + dy * kw
+				ax[b] = ax[b] - dx * kw; ay[b] = ay[b] - dy * kw
 			end
-			scale.Scale = 1
-			local px, py = abs.X + offX, abs.Y + offY
-			gui.AnchorPoint = Vector2.new(gx, gy)
-			gui.Position = UDim2.new(0, px, 0, py)
-			states[gui] = {
-				px = px, py = py, tx = px, ty = py, vx = 0, vy = 0, rot = 0, vr = 0, sc = 1,
-				gx = gx, gy = gy, sx = size.X, sy = size.Y, offY = offY, held = true, scale = scale,
+			local g = R.grab
+			if g then
+				local gx, gy, gvx, gvy = 0, 0, 0, 0
+				for q = 1, 4 do
+					local n, w = g.n[q], g.w[q]
+					gx = gx + w * px[n]; gy = gy + w * py[n]; gvx = gvx + w * vx[n]; gvy = gvy + w * vy[n]
+				end
+				local K_ = CFG.grab
+				local Cg = 2 * sqrt(K_) * 0.55
+				local fx = ((g.tx - gx) * K_ - gvx * Cg) / g.w2
+				local fy = ((g.ty - gy) * K_ - gvy * Cg) / g.w2
+				for q = 1, 4 do
+					local n, w = g.n[q], g.w[q]
+					ax[n] = ax[n] + fx * w; ay[n] = ay[n] + fy * w
+				end
+			end
+			local hm = R.home
+			if hm then
+				for n = 1, NN do
+					ax[n] = ax[n] + (hm.x + rx[n] - px[n]) * hm.k - vx[n] * hm.c
+					ay[n] = ay[n] + (hm.y + ry[n] - py[n]) * hm.k - vy[n] * hm.c
+				end
+			end
+			for n = 1, NN do
+				vx[n] = vx[n] + (ax[n] - c * vx[n]) * h
+				vy[n] = vy[n] + (ay[n] - c * vy[n]) * h
+				px[n] = px[n] + vx[n] * h
+				py[n] = py[n] + vy[n] * h
+			end
+			if CFG.collide then
+				local VX, VY, e = R.VX, R.VY, CFG.restitution
+				for n = 1, NN do
+					if px[n] < 0 then px[n] = 0; if vx[n] < 0 then vx[n] = -vx[n] * e; vy[n] = vy[n] * 0.92 end
+					elseif px[n] > VX then px[n] = VX; if vx[n] > 0 then vx[n] = -vx[n] * e; vy[n] = vy[n] * 0.92 end end
+					if py[n] < 0 then py[n] = 0; if vy[n] < 0 then vy[n] = -vy[n] * e; vx[n] = vx[n] * 0.92 end
+					elseif py[n] > VY then py[n] = VY; if vy[n] > 0 then vy[n] = -vy[n] * e; vx[n] = vx[n] * 0.92 end end
+				end
+			end
+		end
+
+		local function centroid(R)
+			local sx, sy = 0, 0
+			for n = 1, NN do sx = sx + R.px[n] - R.rx[n]; sy = sy + R.py[n] - R.ry[n] end
+			return sx / NN, sy / NN
+		end
+
+		local function snapToRest(R)
+			local cx, cy = centroid(R)
+			R.winX, R.winY = floor(cx + 0.5), floor(cy + 0.5)
+			if CFG.collide and R.VX > 0 then
+				R.winX = clamp(R.winX, 0, max(0, R.VX - R.WW))
+				R.winY = clamp(R.winY, 0, max(0, R.VY - R.WH))
+			end
+		end
+
+		local function settleCheck(R)
+			local ox, oy = centroid(R)
+			local maxV, maxD = 0, 0
+			for n = 1, NN do
+				local v = R.vx[n] * R.vx[n] + R.vy[n] * R.vy[n]
+				if v > maxV then maxV = v end
+				local dx, dy = R.px[n] - R.rx[n] - ox, R.py[n] - R.ry[n] - oy
+				local d = dx * dx + dy * dy
+				if d > maxD then maxD = d end
+			end
+			local homeOk = not R.home or (abs(ox - R.home.x) < 0.6 and abs(oy - R.home.y) < 0.6)
+			if maxV < 0.8 and maxD < 0.12 and homeOk then
+				snapToRest(R); resetNodes(R)
+				R.simulating, R.home = false, nil
+				R.meshDirty, R.glassDirty = true, true
+				return true
+			end
+			return false
+		end
+
+		---------------------------------------------------------------- projection + mesh updates
+		local function projX(R, x, depth) return clamp((2 * x / R.VX - 1) * depth * V.tanH * (R.VX / R.VY), -7.9, 7.9) end
+		local function projY(R, y, depth) return clamp((1 - 2 * y / R.VY) * depth * V.tanH, -7.9, 7.9) end
+
+		local function updateWinMesh(R)
+			evalList(R, R.wts.win, R.sxW, R.syW)
+			local sh = R.winSheet
+			local em, vids = sh.em, sh.vids
+			local V3 = Vector3.new
+			for k = 1, sh.n do
+				em:SetPosition(vids[k], V3(projX(R, R.sxW[k], 1), projY(R, R.syW[k], 1), -1))
+			end
+		end
+
+		-- the glass lives in the world camera's space, so screen px = local px + gui inset
+		local function gProjX(x, depth, cvx, cvy) return clamp((2 * x / cvx - 1) * depth * V.tanH * (cvx / cvy), -7.9, 7.9) end
+		local function gProjY(y, depth, cvy) return clamp((1 - 2 * y / cvy) * depth * V.tanH, -7.9, 7.9) end
+
+		local function updateGlass(R)
+			if not R.glassPart.Parent then return end
+			evalList(R, R.wts.glass, R.gX, R.gY)
+			local sh = R.glassSheet
+			local em, vids, nF, nB = sh.em, sh.vids, sh.nF, sh.nB
+			local amt = CFG.refract * 0.45
+			local V3 = Vector3.new
+			local cvx, cvy = V.cvx, V.cvy
+			local gx_, gy_, gz_ = R.gx_, R.gy_, R.gz_
+			for k = 1, sh.n do
+				local depth = DG * (1 + amt * R.gProf[k])
+				local wx, wy = gProjX(R.gX[k], depth, cvx, cvy), gProjY(R.gY[k] + V.insetY, depth, cvy)
+				gx_[k], gy_[k], gz_[k] = wx, wy, -depth
+				em:SetPosition(vids[k], V3(wx, wy, -depth))
+			end
+			local n1 = GRX + 1
+			for j = 0, GRY do
+				for i = 0, GRX do
+					local k = j * n1 + i + 1
+					local kl, kr = (i > 0) and k - 1 or k, (i < GRX) and k + 1 or k
+					local ku, kd = (j > 0) and k - n1 or k, (j < GRY) and k + n1 or k
+					local ux, uy, uz = gx_[kr] - gx_[kl], gy_[kr] - gy_[kl], gz_[kr] - gz_[kl]
+					local wx, wy, wz = gx_[ku] - gx_[kd], gy_[ku] - gy_[kd], gz_[ku] - gz_[kd]
+					local nx, ny, nz = uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx
+					local l = sqrt(nx * nx + ny * ny + nz * nz)
+					if l > 1e-9 then
+						nx, ny, nz = nx / l, ny / l, nz / l
+						em:SetNormal(nF[k], V3(nx, ny, nz))
+						em:SetNormal(nB[k], V3(-nx, -ny, -nz))
+					end
+				end
+			end
+		end
+
+		---------------------------------------------------------------- rig = per-window mesh state
+		-- (re)computes everything that depends on the window size
+		local function layoutRig(R, WW, WH)
+			R.WW, R.WH = WW, WH
+			R.TXW, R.TXH = (WW + 2 * MG) * SS, (WH + 2 * MG) * SS
+			-- new texture (EditableImage size is fixed at creation)
+			if R.winImg then pcall(function() R.winImg:Destroy() end) end
+			R.winImg = AssetService:CreateEditableImage({Size = Vector2.new(R.TXW, R.TXH)})
+			R.canvas = buffer.create(R.TXW * R.TXH * 4)
+			drawBackground(R)
+			R.winImg:WritePixelsBuffer(Vector2.zero, Vector2.new(R.TXW, R.TXH), R.canvas)
+			R.canvas = nil -- free the 2.5 MB buffer, it is rebuilt on the next resize
+			local mp = R.winSheet.mp
+			local sa = mp:FindFirstChildOfClass("SurfaceAppearance")
+			if sa then
+				sa.ColorMapContent = Content.fromObject(R.winImg)
+			else
+				mp.TextureContent = Content.fromObject(R.winImg)
+			end
+			layoutSheet(R.winSheet, WW, WH)
+			layoutSheet(R.glassSheet, WW, WH)
+			R.gU, R.gV, R.gProf = {}, {}, {}
+			local r = CFG.radius
+			for k = 1, R.glassSheet.n do
+				local u, v = R.glassSheet.us[k], R.glassSheet.vs[k]
+				local cxr, cyr = clamp(u, r, WW - r), clamp(v, r, WH - r)
+				local dx, dy = u - cxr, v - cyr
+				local d = sqrt(dx * dx + dy * dy)
+				if d > r and d > 0 then u, v = cxr + dx / d * r, cyr + dy / d * r end
+				R.gU[k], R.gV[k] = u, v
+				local p = 1 - clamp(-sdRound(u, v, 0, 0, WW, WH, r) / 34, 0, 1)
+				R.gProf[k] = p * p
+			end
+			initNodes(R)
+			R.wts = {
+				win = buildWeights(WW, WH, R.winSheet.us, R.winSheet.vs, R.winSheet.n),
+				glass = buildWeights(WW, WH, R.gU, R.gV, R.glassSheet.n),
 			}
-			if not conn then
-				conn = service.RunService.Heartbeat:Connect(step)
+			R.sxW, R.syW, R.gX, R.gY = {}, {}, {}, {}
+			R.gx_, R.gy_, R.gz_ = {}, {}, {}
+			R.simulating, R.grab, R.home = false, nil, nil
+			R.meshDirty, R.glassDirty = true, true
+		end
+
+		local function destroyRig(R)
+			for _, o in ipairs({R.vf, R.glassPart, R.winImg, R.winSheet and R.winSheet.em, R.glassSheet and R.glassSheet.em}) do
+				if o then pcall(function() o:Destroy() end) end
 			end
+			R.ready = false
+		end
+
+		local function buildRig(R)
+			local win = R.window
+			local sz = win.GuiElems.Main.AbsoluteSize
+			local WW, WH = floor(sz.X + 0.5), floor(sz.Y + 0.5)
+			local ok, err = pcall(function()
+				local vf = Instance.new("ViewportFrame")
+				vf.Name = "SkinViewport"
+				vf.BackgroundTransparency = 1
+				vf.Size = UDim2.fromScale(1, 1)
+				vf.Ambient = Color3.new(1, 1, 1)
+				vf.LightColor = Color3.new(0, 0, 0)
+				vf.ZIndex = 1
+				vf.Active = false
+				vf.Visible = false
+				vf.Parent = win.Gui
+				R.vf = vf
+				R.vcam = Instance.new("Camera")
+				R.vcam.CFrame = CFrame.new()
+				R.vcam.Parent = vf
+				vf.CurrentCamera = R.vcam
+
+				R.winSheet = newSheet(RX, RY, false)
+				R.glassSheet = newSheet(GRX, GRY, true)
+				layoutSheet(R.winSheet, WW, WH)
+				layoutSheet(R.glassSheet, WW, WH)
+				R.winSheet.mp = sheetPart(R.winSheet)
+				R.glassSheet.mp = sheetPart(R.glassSheet)
+
+				local mp = R.winSheet.mp
+				local sa = useAlpha and trySA()
+				if sa then sa.Parent = mp end
+				mp.Material = Enum.Material.SmoothPlastic
+				mp.Color = Color3.new(1, 1, 1)
+				mp.Parent = vf
+
+				local gp = R.glassSheet.mp
+				gp.Material = Enum.Material.Glass
+				gp.Name = "DexSkinGlass"
+				gp.Color = C3(CFG.tint)
+				gp.Reflectance = CFG.reflect
+				R.glassPart = gp
+
+				layoutRig(R, WW, WH)
+			end)
+			if not ok then
+				warn("[BAD DEX Skin] mesh rig failed, using plain glass frame: " .. tostring(err))
+				destroyRig(R)
+				R.failed = true
+				return false
+			end
+			R.winX, R.winY = 0, 0
+			R.ready = true
 			return true
 		end
 
-		function W.Active(gui) return states[gui] ~= nil end
-
-		function W.Target(gui, cursorX, cursorY)
-			local st = states[gui]
-			if not st then return end
-			st.tx = cursorX
-			st.ty = cursorY < st.offY and st.offY or cursorY -- keep the title bar on screen
+		---------------------------------------------------------------- chrome (title bar, traffic lights, fallback frame)
+		local function mkLight(parent, color, x, glyph)
+			local b = Instance.new("TextButton")
+			b.Name = "SkinLight"
+			b.AutoButtonColor = false
+			b.Text = ""
+			b.BorderSizePixel = 0
+			b.BackgroundColor3 = C3(color)
+			b.Size = UDim2.fromOffset(12, 12)
+			b.Position = UDim2.fromOffset(x, 4)
+			b.ZIndex = 5
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(1, 0)
+			c.Parent = b
+			local t = Instance.new("TextLabel")
+			t.BackgroundTransparency = 1
+			t.Size = UDim2.fromScale(1, 1)
+			t.Text = glyph
+			t.TextSize = 11
+			t.TextColor3 = Color3.fromRGB(60, 20, 10)
+			t.TextTransparency = 1
+			t.ZIndex = 6
+			if FONT_MED then t.FontFace = FONT_MED end
+			t.Parent = b
+			b.MouseEnter:Connect(function() t.TextTransparency = 0.1 end)
+			b.MouseLeave:Connect(function() t.TextTransparency = 1 end)
+			b.Parent = parent
+			return b
 		end
 
-		-- release: let the spring settle on its own
-		function W.End(gui)
-			local st = states[gui]
-			if st then st.held = false end
+		local function applyChrome(R)
+			local win = R.window
+			local e = win.GuiElems
+			local main, bar = e.Main, e.TopBar
+			-- fallback glass frame (visible whenever the mesh is not)
+			local fb = Instance.new("Frame")
+			fb.Name = "SkinFallback"
+			fb.BorderSizePixel = 0
+			fb.BackgroundColor3 = C3(ST.bg)
+			fb.BackgroundTransparency = 0.35
+			fb.Size = UDim2.fromScale(1, 1)
+			fb.ZIndex = 0
+			fb.Visible = false
+			Instance.new("UICorner", fb).CornerRadius = UDim.new(0, CFG.radius)
+			local st = Instance.new("UIStroke")
+			st.Color = Color3.new(1, 1, 1)
+			st.Thickness = 1
+			st.Transparency = 0.25
+			st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+			st.Parent = fb
+			local gr = Instance.new("UIGradient")
+			gr.Rotation = 25
+			gr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(0.5, 0.8), NumberSequenceKeypoint.new(1, 0.1)})
+			gr.Parent = st
+			fb.Parent = main
+			R.fallback = fb
+
+			-- traffic lights (replace Dex's close / minimise images)
+			R.lights = {}
+			R.lights.close = mkLight(bar, ST.close, 6, "x")
+			R.lights.min = mkLight(bar, ST.min, 22, "-")
+			R.lights.center = mkLight(bar, ST.center, 38, "+")
+			R.lights.close.MouseButton1Click:Connect(function()
+				if win.Closed then return end
+				win:Close()
+			end)
+			R.lights.min.MouseButton1Click:Connect(function()
+				if win.Closed then return end
+				if win.Aligned then win:SetAligned(false) else win:SetMinimized() end
+			end)
+			R.lights.center.MouseButton1Click:Connect(function()
+				Skin.Center(win)
+			end)
+			for _, l in pairs(R.lights) do l.Visible = false end
+			R.chromeOn = false
 		end
 
-		-- snap immediately (used when the window docks to a side)
-		function W.Cancel(gui)
-			local st = states[gui]
-			if st then finalize(gui, st) end
+		-- applies / removes the Skidnet look depending on the window mode (floating vs docked to a side)
+		local function setChrome(R, on)
+			if R.chromeOn == on then return end
+			R.chromeOn = on
+			local e = R.window.GuiElems
+			for _, l in pairs(R.lights) do l.Visible = on end
+			e.Close.Visible, e.Minimize.Visible = not on, not on
+			if not on then
+				e.Title.Position, e.Title.Size, e.Title.TextXAlignment = UDim2.new(0, 5, 0, 0), UDim2.new(1, -10, 0, 20), Enum.TextXAlignment.Left
+				e.TopBar.BackgroundTransparency = 0
+				e.Outlines.Visible = true
+				R.fallback.Visible = false
+				pcall(function()
+					e.Title.Font = Enum.Font.SourceSans
+					e.Title.TextSize = 14
+					if R.origContent then e.Content.BackgroundColor3 = R.origContent end
+				end)
+				return
+			end
+			R.origContent = R.origContent or e.Content.BackgroundColor3
+			e.Title.Position, e.Title.Size, e.Title.TextXAlignment = UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 20), Enum.TextXAlignment.Center
+			e.Title.TextColor3 = C3(ST.text)
+			if FONT_MED then e.Title.FontFace = FONT_MED end
+			e.Title.TextSize = 13
+			local cr = e.Main:FindFirstChildOfClass("UICorner")
+			if cr then cr.CornerRadius = UDim.new(0, CFG.radius) end
+			local cc = e.Content:FindFirstChildOfClass("UICorner") or Instance.new("UICorner", e.Content)
+			cc.CornerRadius = UDim.new(0, max(CFG.radius, 4))
+			e.Content.ClipsDescendants = true
+			e.Content.BackgroundColor3 = C3(ST.bg)
+			e.Main.ZIndex = 2
 		end
 
-		return W
+		-- keeps properties that Dex's own code resets (e.g. Show() sets TopBar/Outlines back) in the skinned state
+		local function syncChrome(R, meshOn)
+			local e = R.window.GuiElems
+			if R.chromeOn then
+				if e.TopBar.BackgroundTransparency ~= 1 then e.TopBar.BackgroundTransparency = 1 end
+				if e.Outlines.Visible then e.Outlines.Visible = false end
+				local fbVisible = not meshOn and not R.window.Closed
+				if R.fallback.Visible ~= fbVisible then R.fallback.Visible = fbVisible end
+				if e.Close.Visible then e.Close.Visible = false end
+				if e.Minimize.Visible then e.Minimize.Visible = false end
+			end
+		end
+
+		---------------------------------------------------------------- pointer / grab
+		local function pointer(R)
+			local g = R.grab
+			if g and g.touch and lastTouch then return lastTouch end
+			local m = UIS:GetMouseLocation()
+			return Vector2.new(m.X, m.Y - V.insetY)
+		end
+
+		local function rigOrigin(R)
+			local vp = R.vf.AbsolutePosition
+			local mp = R.window.GuiElems.Main.AbsolutePosition
+			return mp.X - vp.X, mp.Y - vp.Y
+		end
+
+		---------------------------------------------------------------- per-frame
+		local function poke(R, u, v, power)
+			R.simulating = true
+			for n = 1, NN do
+				local dx, dy = R.rx[n] - u, R.ry[n] - v
+				local d = sqrt(dx * dx + dy * dy) + 1
+				local f = exp(-(d * d) / (2 * 120 * 120)) * (power or 620)
+				R.vx[n] = R.vx[n] + dx / d * f; R.vy[n] = R.vy[n] + dy / d * f
+			end
+		end
+
+		local function meshWanted(R)
+			local win = R.window
+			if not (Skin.Enabled and R.ready and not R.failed and not Skin.Hidden) then return false end
+			if win.Closed or win.Aligned or win.Minimized or win.Resizing then return false end
+			if not win.Gui.Parent then return false end
+			return true
+		end
+
+		local function stepRig(R, dt)
+			local win = R.window
+			local main = win.GuiElems.Main
+			if not R.chromeOn and not win.Aligned then setChrome(R, true) end
+			if R.chromeOn and win.Aligned then setChrome(R, false) end
+
+			local sz = main.AbsoluteSize
+
+			-- lazy build (CreateMeshPartAsync yields, so it runs in its own thread)
+			if not R.ready and not R.failed and not R.building and Skin.Enabled and not win.Closed and not win.Aligned
+				and not win.Minimized and not win.Resizing and win.Gui.Parent and sz.X >= 80 and sz.Y >= 60
+				and abs(sz.X - win.SizeX) < 1.5 and abs(sz.Y - win.SizeY) < 1.5 then
+				R.building = true
+				task.spawn(function()
+					buildRig(R)
+					R.building = false
+				end)
+			end
+
+			if not R.ready then syncChrome(R, false) return end
+			local sizeOk = floor(sz.X + 0.5) == R.WW and floor(sz.Y + 0.5) == R.WH
+			local want = meshWanted(R)
+
+			-- window got resized (Dex handle / tween): mesh is rebuilt once the size is stable
+			if R.ready and not sizeOk and not win.Closed and not win.Aligned and not win.Minimized and not win.Resizing and sz.X > 80 and sz.Y > 60 then
+				if R.lastSz ~= sz then R.lastSz = sz; R.sizeStable = 0 else R.sizeStable = (R.sizeStable or 0) + dt end
+				if R.sizeStable > 0.2 and not R.busy then
+					R.busy = true
+					task.spawn(function()
+						local ok, err = pcall(layoutRig, R, floor(sz.X + 0.5), floor(sz.Y + 0.5))
+						if not ok then warn("[BAD DEX Skin] relayout failed: " .. tostring(err)) R.failed = true end
+						R.winX, R.winY = 0, 0
+						R.needSync = true
+						R.busy = false
+						R.lastSz, R.sizeStable = nil, 0
+						R.popOnShow = true
+					end)
+				end
+			elseif sizeOk then
+				R.lastSz, R.sizeStable = nil, 0
+			end
+			if not sizeOk or R.busy then want = false end
+
+			local meshOn = want
+			if meshOn ~= R.meshOn then
+				R.meshOn = meshOn
+				R.vf.Visible = meshOn
+				R.glassPart.Parent = (meshOn and useAlpha and Skin.UseGlass and cam) or nil
+				R.meshDirty, R.glassDirty, R.needSync = true, true, true
+				if meshOn and R.popOnShow then R.popOnShow = nil poke(R, R.WW / 2, R.WH / 2, 380) end
+			end
+			syncChrome(R, meshOn)
+			if not meshOn then
+				R.simulating, R.grab, R.home = false, nil, nil
+				return
+			end
+
+			R.VX, R.VY = R.vf.AbsoluteSize.X, R.vf.AbsoluteSize.Y
+			if R.VX < 1 or R.VY < 1 then return end
+
+			if not R.simulating then
+				-- follow Dex moving the window (tweens, MoveInBoundary, docking...)
+				local ox, oy = rigOrigin(R)
+				ox, oy = floor(ox + 0.5), floor(oy + 0.5)
+				if R.needSync or ox ~= R.winX or oy ~= R.winY then
+					R.needSync = false
+					R.winX, R.winY = ox, oy
+					resetNodes(R)
+					R.meshDirty, R.glassDirty = true, true
+				end
+			else
+				local hmax = min(MAX_H, 0.9 / sqrt(CFG.stiffness * 54 + CFG.grab * 4 + 1))
+				local subs = max(1, ceil(dt / hmax))
+				local h = dt / subs
+				local g = R.grab
+				if g then
+					local p = pointer(R)
+					g.tx, g.ty = p.X + g.ox, p.Y + g.oy
+				end
+				for _ = 1, subs do physicsStep(R, h) end
+				R.meshDirty, R.glassDirty = true, true
+				-- the real window (content) rides the centre of the jelly
+				local cx, cy = centroid(R)
+				main.Position = fromOffset(cx, cy)
+				if not g then settleCheck(R) end
+				if not R.simulating then main.Position = fromOffset(R.winX, R.winY) end
+			end
+
+			if R.meshDirty then
+				R.meshDirty = false
+				R.vcam.FieldOfView = V.fov
+				updateWinMesh(R)
+			end
+			if R.glassPart.Parent then
+				R.glassPart.Transparency = 1 - (1 - CFG.glassTransp)
+				R.glassPart.CFrame = cam.CFrame
+				if R.glassDirty then
+					R.glassDirty = false
+					updateGlass(R)
+				end
+			end
+		end
+
+		---------------------------------------------------------------- public: drag hooks used by Lib.Window
+		-- true when the mesh rig took over this window's drag (Dex then must NOT set Main.Position itself)
+		function Skin.DragBegin(win)
+			local R = rigs[win]
+			if not R or not R.meshOn or not CFG.jellyClick then return false end
+			local p = UIS:GetMouseLocation()
+			local lp = Vector2.new(p.X, p.Y - V.insetY)
+			local touch = false
+			R.VX, R.VY = R.vf.AbsoluteSize.X, R.vf.AbsoluteSize.Y
+			if not R.simulating then
+				local ox, oy = rigOrigin(R)
+				R.winX, R.winY = floor(ox + 0.5), floor(oy + 0.5)
+				resetNodes(R)
+			end
+			local cx, cy = centroid(R)
+			local u = clamp(lp.X - cx, 0, R.WW)
+			local v = clamp(lp.Y - cy, 0, R.WH)
+			local fu = clamp(u / R.WW * (PX - 1), 0, PX - 1 - 1e-6)
+			local fv = clamp(v / R.WH * (PY - 1), 0, PY - 1 - 1e-6)
+			local i, j = floor(fu), floor(fv)
+			local tx, ty = fu - i, fv - j
+			local n0 = j * PX + i + 1
+			local g = {n = {n0, n0 + 1, n0 + PX, n0 + PX + 1}, w = {(1 - tx) * (1 - ty), tx * (1 - ty), (1 - tx) * ty, tx * ty}, touch = touch}
+			local gx, gy, w2 = 0, 0, 0
+			for q = 1, 4 do
+				gx = gx + g.w[q] * R.px[g.n[q]]; gy = gy + g.w[q] * R.py[g.n[q]]
+				w2 = w2 + g.w[q] * g.w[q]
+			end
+			g.w2, g.ox, g.oy, g.tx, g.ty = w2, gx - lp.X, gy - lp.Y, gx, gy
+			R.grab, R.home, R.simulating = g, nil, true
+			return true
+		end
+
+		function Skin.Drag(win)
+			local R = rigs[win]
+			return R ~= nil and R.grab ~= nil
+		end
+
+		function Skin.DragEnd(win)
+			local R = rigs[win]
+			if R then R.grab = nil end
+		end
+
+		-- docking etc.: stop the jelly and let Dex place the window
+		function Skin.Cancel(win)
+			local R = rigs[win]
+			if not R then return end
+			R.grab, R.home = nil, nil
+			if R.simulating then
+				snapToRest(R)
+				R.simulating = false
+				win.GuiElems.Main.Position = fromOffset(R.winX, R.winY)
+			end
+		end
+
+		function Skin.Center(win)
+			local R = rigs[win]
+			if not R or not R.meshOn then
+				local main = win.GuiElems.Main
+				local vs = cam and cam.ViewportSize or Vector2.new(800, 600)
+				main.Position = UDim2.fromOffset(floor(vs.X / 2 - win.SizeX / 2), floor(vs.Y / 2 - win.SizeY / 2))
+				return
+			end
+			local ox, oy = rigOrigin(R)
+			R.winX, R.winY = floor(ox + 0.5), floor(oy + 0.5)
+			if not R.simulating then resetNodes(R) end
+			R.simulating = true
+			R.grab = nil
+			R.home = {x = floor(R.VX / 2 - R.WW / 2), y = floor(R.VY / 2 - R.WH / 2), k = 60, c = 7}
+		end
+
+		---------------------------------------------------------------- watermark (RightCtrl)
+		local WM = {}
+		local function buildWatermark()
+			local g = Instance.new("ScreenGui")
+			g.Name = "DexSkinWatermark"
+			g.ResetOnSpawn = false
+			g.DisplayOrder = 100500
+			g.IgnoreGuiInset = true
+			pcall(function() Main.SecureGui(g) end)
+			if not g.Parent then g.Parent = Players.LocalPlayer:WaitForChild("PlayerGui") end
+			local wm = Instance.new("TextButton")
+			wm.Name = "Watermark"
+			wm.Text = ""
+			wm.AutoButtonColor = false
+			wm.BorderSizePixel = 0
+			wm.Size = fromOffset(220, 32)
+			wm.AnchorPoint = Vector2.new(0.5, 0)
+			wm.Position = UDim2.new(0.5, 0, 0, 14)
+			wm.Visible = false
+			wm.ZIndex = 20
+			wm.BackgroundColor3 = C3(ST.bg)
+			wm.BackgroundTransparency = 0.45
+			Instance.new("UICorner", wm).CornerRadius = UDim.new(1, 0)
+			local st = Instance.new("UIStroke")
+			st.Color, st.Thickness, st.Transparency, st.ApplyStrokeMode = Color3.new(1, 1, 1), 1, 0.25, Enum.ApplyStrokeMode.Border
+			st.Parent = wm
+			local gr = Instance.new("UIGradient")
+			gr.Rotation = 25
+			gr.Transparency = NumberSequence.new({NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(0.5, 0.8), NumberSequenceKeypoint.new(1, 0.1)})
+			gr.Parent = st
+			WM.scale = Instance.new("UIScale")
+			WM.scale.Parent = wm
+			local dot = Instance.new("Frame")
+			dot.Size, dot.Position, dot.BorderSizePixel, dot.BackgroundColor3 = fromOffset(8, 8), fromOffset(13, 12), 0, C3(ST.accent)
+			Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+			dot.Parent = wm
+			local txt = Instance.new("TextLabel")
+			txt.BackgroundTransparency = 1
+			txt.TextSize = 13
+			txt.RichText = true
+			txt.TextColor3 = C3(ST.text)
+			txt.Position, txt.Size = fromOffset(28, 0), fromOffset(180, 32)
+			txt.TextXAlignment = Enum.TextXAlignment.Left
+			if FONT_MED then txt.FontFace = FONT_MED end
+			txt.Parent = wm
+			wm.Parent = g
+			WM.gui, WM.frame, WM.text = g, wm, txt
+			wm.MouseButton1Click:Connect(function() Skin.SetHidden(false) end)
+		end
+
+		local fps, fpsN, fpsT = 60, 0, 0
+		local function updateWatermark()
+			if not WM.frame or not WM.frame.Visible then return end
+			local plr = Players.LocalPlayer
+			local ping = 0
+			pcall(function() ping = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue() end)
+			if ping == 0 then pcall(function() ping = plr:GetNetworkPing() * 2000 end) end
+			local sep = '<font color="#9aa3ad">  ·  </font>'
+			WM.text.Text = "BAD DEX" .. sep .. (plr and plr.DisplayName or "Player") .. sep .. floor(fps + 0.5) .. " FPS" .. sep .. floor(ping + 0.5) .. " ms"
+			local w = WM.text.TextBounds.X
+			if w > 0 then
+				WM.frame.Size = fromOffset(w + 42, 32)
+				WM.text.Size = fromOffset(w + 10, 32)
+			end
+		end
+
+		-- [SKIN:HIDE] RightCtrl: collapse every Dex window + the launcher into the watermark pill and back
+		function Skin.SetHidden(on)
+			if on == Skin.Hidden then return end
+			Skin.Hidden = on
+			for win in pairs(rigs) do pcall(function() win.Gui.Enabled = not on end) end
+			if Lib.Window.SetSidesEnabled then pcall(Lib.Window.SetSidesEnabled, not on) end
+			pcall(function() Main.MainGui.Enabled = not on end)
+			if not WM.frame then buildWatermark() end
+			WM.frame.Visible = on
+			if on then
+				updateWatermark()
+				WM.scale.Scale = 0.4
+				TweenService:Create(WM.scale, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Scale = 1}):Play()
+			end
+		end
+
+		---------------------------------------------------------------- lifecycle
+		local initialised = false
+		local function frame(dt)
+			dt = min(dt, 1 / 15)
+			cam = workspace.CurrentCamera
+			if not cam then return end
+			local vs = cam.ViewportSize
+			V.cvx, V.cvy = vs.X, vs.Y
+			V.insetY = GuiService:GetGuiInset().Y
+			if cam.FieldOfView ~= V.fov then
+				V.fov = cam.FieldOfView
+				V.tanH = math.tan(math.rad(V.fov) / 2)
+				for _, R in ipairs(rigList) do R.meshDirty, R.glassDirty = true, true end
+			end
+			fpsN = fpsN + 1; fpsT = fpsT + dt
+			if fpsT >= 0.5 then
+				fps = fpsN / fpsT
+				fpsN, fpsT = 0, 0
+				updateWatermark()
+			end
+			for _, R in ipairs(rigList) do
+				local ok, err = pcall(stepRig, R, dt)
+				if not ok and not R.warned then
+					R.warned = true
+					warn("[BAD DEX Skin] " .. tostring(err))
+				end
+			end
+		end
+
+		local function init()
+			if initialised then return end
+			initialised = true
+			cam = workspace.CurrentCamera
+			table.insert(conns, UIS.InputChanged:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.Touch then
+					lastTouch = Vector2.new(input.Position.X, input.Position.Y)
+				end
+			end))
+			table.insert(conns, UIS.InputBegan:Connect(function(input, processed)
+				if input.KeyCode == Enum.KeyCode.RightControl and not UIS:GetFocusedTextBox() then
+					Skin.SetHidden(not Skin.Hidden)
+				end
+			end))
+			RunService:BindToRenderStep("DexSkin", Enum.RenderPriority.Camera.Value + 1, frame)
+		end
+
+		-- called by Lib.Window.new for every window
+		function Skin.Attach(win)
+			if rigs[win] then return end
+			local R = {window = win, ready = false, VX = 0, VY = 0, winX = 0, winY = 0}
+			rigs[win] = R
+			table.insert(rigList, R)
+			applyChrome(R)
+			init()
+			-- the mesh itself is built lazily on the first frame the window is really visible (see stepRig)
+			if not checkSupport() then R.failed = true end
+		end
+
+		function Skin.Detach(win)
+			local R = rigs[win]
+			if not R then return end
+			rigs[win] = nil
+			local i = table.find(rigList, R)
+			if i then table.remove(rigList, i) end
+			destroyRig(R)
+		end
+
+		function Skin.Destroy()
+			pcall(function() RunService:UnbindFromRenderStep("DexSkin") end)
+			for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+			conns = {}
+			for win, R in pairs(rigs) do destroyRig(R) end
+			if WM.gui then WM.gui:Destroy() end
+		end
+
+		return Skin
 	end)()
 
 	Lib.Window = (function()
@@ -6431,14 +7394,14 @@ local function main()
 						local alignInsertPos, alignInsertSide
 
 						guiDragging = true
-						if not self.Aligned then Lib.Wobbly.Begin(guiMain, offX, offY) end
+						if not self.Aligned then Lib.Skin.DragBegin(self) end
 
 						releaseEvent = service.UserInputService.InputEnded:Connect(function(input)
 							if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 								releaseEvent:Disconnect()
 								if mouseEvent then mouseEvent:Disconnect() end
 								guiDragging = false
-								if alignInsertSide then Lib.Wobbly.Cancel(guiMain) else Lib.Wobbly.End(guiMain) end
+								if alignInsertSide then Lib.Skin.Cancel(self) else Lib.Skin.DragEnd(self) end
 								alignIndicator.Parent = nil
 								if alignInsertSide then
 									local targetSide = (alignInsertSide == "left" and leftSide) or (alignInsertSide == "right" and rightSide)
@@ -6460,9 +7423,7 @@ local function main()
 									local inputX, inputY = input.Position.X, input.Position.Y
 									local posX, posY = inputX - offX, inputY - offY
 									if posY < 0 then posY = 0 end
-									if Lib.Wobbly.Active(guiMain) then
-										Lib.Wobbly.Target(guiMain, inputX, inputY)
-									else
+									if not Lib.Skin.Drag(self) then
 										guiMain.Position = UDim2.new(0, posX, 0, posY)
 									end
 
@@ -7010,6 +7971,7 @@ local function main()
 			self.Aligned = false
 			--self.Gui.Parent = nil
 			updateWindows(true)
+			pcall(Lib.Skin.Detach, self)
 			self.Gui:Destroy()
 		end
 
@@ -7252,7 +8214,12 @@ local function main()
 				OnRestore = Lib.Signal.new()
 			},mt)
 			obj.Gui = createGui(obj)
+			Lib.Skin.Attach(obj)
 			return obj
+		end
+
+		static.SetSidesEnabled = function(v)
+			if sidesGui then sidesGui.Enabled = v end
 		end
 
 		return static
@@ -11087,14 +12054,14 @@ end,
 --[[
 	Spies App Module (BAD DEX)
 
-	SimpleSpy / Cobalt / Hydroxide / Closure Spy / Hook Spy / Metatable Spy
+	UtopiaSpy / Cobalt / Hydroxide / Closure Spy / Hook Spy / Metatable Spy
 	+ Originals (loads the real tools) in a single window with tabs.
 
 	Search for "[SPIES:" to jump to the places meant for editing:
 	  [SPIES:SERIALIZE]      value -> Lua text
 	  [SPIES:CODEGEN]        remote call -> runnable snippet
 	  [SPIES:PANEL]          tab/panel builder
-	  [SPIES:NAMECALL-HOOK]  global __namecall hook (SimpleSpy + Cobalt)
+	  [SPIES:NAMECALL-HOOK]  global __namecall hook (UtopiaSpy + Cobalt)
 	  [SPIES:REMOTE-HOOK]    per-call logic: filter / rewrite / block
 	  [SPIES:DIRECT-HOOK]    remote.FireServer(remote, ...) form
 	  [SPIES:CLOSURE-HOOK]   Closure Spy wrapper
@@ -11103,6 +12070,10 @@ end,
 	  [SPIES:META-HOOKS]     Metatable tab hooks
 	  [SPIES:HTTP] / [SPIES:ORIGINALS]  Originals tab loader + script list
 	  [SPIES:TABS]           tab list
+	  [SPIES:UTOPIA]         UtopiaSpy settings (blacklistedNames, maxTableDepth, ...)
+	  [SPIES:UTOPIA-CODEGEN] UtopiaSpy code generator (get_path / get_real_value / convert_to_code)
+	  [SPIES:UTOPIA-CLIENTINVOKE] OnClientInvoke logging
+	  [SPIES:UTOPIA-SRC]     embedded original UtopiaSpy script (Originals tab)
 ]]
 
 -- Common Locals
@@ -11350,7 +12321,7 @@ local function main()
 		return parts
 	end
 
-	-- [SPIES:CODEGEN] turns a captured remote call into a runnable snippet (shown in SimpleSpy/Cobalt details)
+	-- [SPIES:CODEGEN] turns a captured remote call into a runnable snippet (shown in Cobalt details; UtopiaSpy has its own generator, see [SPIES:UTOPIA-CODEGEN])
 	-- Generates a runnable snippet for a remote call
 	local function genRemoteCode(e)
 		local lines = {}
@@ -11610,7 +12581,267 @@ local function main()
 	end
 
 	---------------------------------------------------------------------
-	-- Remote engine (shared by SimpleSpy + Cobalt)
+	-- UtopiaSpy logic (replaces the SimpleSpy tab)
+	--
+	-- Port of the UtopiaSpy script's code generator: get_path / get_real_value / table_to_string /
+	-- convert_to_code / convert_to_code_client, with the same settings table and the same output
+	-- style (`Remote:FireServer(table.unpack({...}))`, `--[[function -->]]` dumps with upvalues,
+	-- constants, protos and info, `utf8.char(...)` for odd instance names, ...).
+	-- The hooks themselves (namecall / FireServer / InvokeServer / OnClientEvent / OnClientInvoke)
+	-- live in the shared remote engine below.
+	--
+	-- [SPIES:UTOPIA] tunables - edit these values to taste:
+	---------------------------------------------------------------------
+	local Utopia = {
+		maxTableDepth = 100,       -- same default as UtopiaSpy: deeper tables become "table_over_maxTableDepth"
+		maxTableEntries = 6000,    -- extra safety: stop dumping one value after this many entries
+		newFunctionMethod = true,  -- true: dump Lua functions as upvalues/constants/protos/info; false: "function() end"
+		blacklistedNames = {},     -- remote NAMES that are never shown, e.g. {"Heartbeat", "UpdateCamera"}
+		invokeClientHook = true,   -- hook OnClientInvoke callbacks (needs getcallbackmember + hookfunction)
+	}
+	Spies.Utopia = Utopia
+	local utopiaDepth, utopiaCount = 0, 0
+	local utopiaPath, utopiaValue
+
+	local function utopiaUtf8(s)
+		local parts = {}
+		local ok = pcall(function() for _, c in utf8.codes(s) do parts[#parts + 1] = tostring(c) end end)
+		if not ok then return esc(s) end
+		return "utf8.char(" .. table.concat(parts, ", ") .. ")"
+	end
+
+	local function utopiaEscape(s)
+		return (s:gsub("\\", "\\\\"):gsub("\0", "\\0"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+			:gsub("\v", "\\v"):gsub("\b", "\\b"):gsub("\f", "\\f"))
+	end
+
+	-- get_path: instance -> Lua expression
+	utopiaPath = function(inst)
+		local name = inst.Name
+		local seg = (#name > 0) and ("." .. name) or "['']"
+		if not inst.Parent and inst ~= game then return seg .. " --[[ Parented to nil ]]" end
+		if inst == game then return "game" end
+		if inst == workspace then return "workspace" end
+		local okSvc, svc = pcall(game.GetService, game, inst.ClassName)
+		local part
+		local strippedWord = name:gsub("[%w_]", "")
+		if okSvc and svc then
+			part = ':GetService("' .. inst.ClassName .. '")'
+		elseif inst == plr then
+			part = ".LocalPlayer"
+		elseif tonumber(name:sub(1, 1)) or (#strippedWord ~= 0 and #(strippedWord:gsub("[%s%p]", "")) == 0) then
+			part = '["' .. name:gsub("\\", "\\\\"):gsub('"', '\\"') .. '"]'
+		elseif #strippedWord ~= 0 and #(strippedWord:gsub("[%s%p]", "")) > 0 then
+			part = "[" .. utopiaUtf8(name) .. "]"
+		else
+			part = seg
+		end
+		return utopiaPath(inst.Parent) .. part
+	end
+
+	local function utopiaTable(t, seen)
+		utopiaDepth = utopiaDepth + 1
+		local depth = utopiaDepth
+		if Utopia.maxTableDepth + 1 < depth then
+			utopiaDepth = utopiaDepth - 1
+			return "table_over_maxTableDepth (.." .. tostring(t) .. ")"
+		end
+		if seen[t] then
+			utopiaDepth = utopiaDepth - 1
+			return "{} --[[ cyclic: " .. safeComment(tostring(t)) .. " ]]"
+		end
+		seen[t] = true
+		local pad = ("    "):rep(depth)
+		local out = {"{"}
+		local ok = pcall(function()
+			for k, v in next, t do
+				utopiaCount = utopiaCount + 1
+				if utopiaCount > Utopia.maxTableEntries then
+					out[#out + 1] = "\n" .. pad .. "--[[ truncated: maxTableEntries reached ]]"
+					break
+				end
+				out[#out + 1] = "\n" .. pad .. "[" .. utopiaValue(k, seen) .. "] = " .. utopiaValue(v, seen) .. ","
+			end
+		end)
+		if not ok then out[#out + 1] = "\n" .. pad .. "--[[ table could not be iterated ]]" end
+		seen[t] = nil
+		utopiaDepth = utopiaDepth - 1
+		return table.concat(out) .. "\n" .. ("    "):rep(utopiaDepth) .. "}"
+	end
+
+	local function utopiaFnInfo(f)
+		local getinfo = (debug and debug.getinfo) or G("getinfo")
+		local info = {}
+		if getinfo then
+			local ok, res = pcall(getinfo, f)
+			if ok and type(res) == "table" then
+				for k, v in pairs(res) do if k ~= "func" then info[k] = v end end
+			end
+		end
+		return info
+	end
+
+	local function utopiaFnDump(f)
+		local dbg = debug or {}
+		local function try(...)
+			for i = 1, select("#", ...) do
+				local fn = select(i, ...)
+				if type(fn) == "function" then
+					local ok, res = pcall(fn, f)
+					if ok then return res end
+				end
+			end
+		end
+		return {
+			upvalues = try(dbg.getupvalues, G("getupvalues")),
+			constants = try(dbg.getconstants, G("getconstants")),
+			protos = try(dbg.getprotos, G("getprotos")),
+			info = utopiaFnInfo(f),
+		}
+	end
+
+	local NORMAL_TYPES = {UDim2 = true, UDim = true, Vector3 = true, Vector2 = true, CFrame = true, Vector2int16 = true,
+		Vector3int16 = true, BrickColor = true, Color3 = true}
+
+	-- get_real_value: any value -> Lua expression text
+	utopiaValue = function(v, seen)
+		seen = seen or {}
+		local tv = typeof(v)
+		if tv == "Instance" then return utopiaPath(v) end
+		if tv == "string" then return '"' .. utopiaEscape(v) .. '"' end
+		if tv == "table" then return utopiaTable(v, seen) end
+		if tv == "function" then
+			local isL = G("islclosure")
+			if isL and isL(v) then
+				if Utopia.newFunctionMethod then
+					return "--[[function -->]] " .. utopiaTable(utopiaFnDump(v), seen)
+				end
+				return "function() end"
+			end
+			return "newcclosure(function() end)"
+		end
+		if tv == "number" then
+			if v ~= v then return "0/0" elseif v == math.huge then return "math.huge" elseif v == -math.huge then return "-math.huge" end
+			return tostring(v)
+		end
+		if tv == "UDim2" then
+			return "UDim2.new(" .. tostring(v.X.Scale) .. ", " .. tostring(v.X.Offset) .. ", " .. tostring(v.Y.Scale) .. ", " .. tostring(v.Y.Offset) .. ")"
+		end
+		if NORMAL_TYPES[tv] then
+			local inner = tv == "BrickColor" and ("'" .. tostring(v) .. "'") or tostring(v)
+			return tv .. ".new(" .. inner .. ")"
+		end
+		if tv == "TweenInfo" then
+			return "TweenInfo.new(" .. utopiaValue(v.Time) .. ", " .. utopiaValue(v.EasingStyle) .. ", " .. utopiaValue(v.EasingDirection)
+				.. ", " .. utopiaValue(v.RepeatCount) .. ", " .. utopiaValue(v.Reverses) .. ", " .. utopiaValue(v.DelayTime) .. ")"
+		end
+		if tv == "Enums" then return "Enum" end
+		if tv == "Enum" then return "Enum." .. tostring(v) end
+		if tv == "EnumItem" then return tostring(v) end
+		if tv == "Axes" or tv == "Faces" then
+			local parts = {}
+			for _, item in ipairs(Enum.NormalId:GetEnumItems()) do
+				if v[item.Name] then parts[#parts + 1] = utopiaValue(item) end
+			end
+			return tv .. ".new(" .. table.concat(parts, ", ") .. ")"
+		end
+		if tv == "ColorSequence" or tv == "NumberSequence" then
+			local parts = {}
+			for _, kp in ipairs(v.Keypoints) do parts[#parts + 1] = utopiaValue(kp) end
+			return tv .. ".new{" .. table.concat(parts, ", ") .. "}"
+		end
+		if tv == "ColorSequenceKeypoint" then return "ColorSequenceKeypoint.new(" .. tostring(v.Time) .. ", " .. utopiaValue(v.Value) .. ")" end
+		if tv == "NumberSequenceKeypoint" then
+			return "NumberSequenceKeypoint.new(" .. tostring(v.Time) .. ", " .. utopiaValue(v.Value) .. (v.Envelope and (", " .. v.Envelope) or "") .. ")"
+		end
+		if tv == "DateTime" then
+			if v.UnixTimestampMillis == DateTime.now().UnixTimestampMillis then return "DateTime.now()" end
+			return "DateTime.fromUnixTimestampMillis(" .. v.UnixTimestampMillis .. ")"
+		end
+		if tv == "FloatCurveKey" then return "FloatCurveKey.new(" .. utopiaValue(v.Time) .. ", " .. utopiaValue(v.Value) .. ", " .. utopiaValue(v.Interpolation) .. ")" end
+		if tv == "NumberRange" then return "NumberRange.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
+		if tv == "PathWaypoint" then return "PathWaypoint.new(" .. utopiaValue(v.Position) .. ", " .. utopiaValue(v.Action) .. ")" end
+		if tv == "PhysicalProperties" then
+			return "PhysicalProperties.new(" .. utopiaValue(v.Density) .. ", " .. utopiaValue(v.Friction) .. ", " .. utopiaValue(v.Elasticity)
+				.. ", " .. utopiaValue(v.FrictionWeight) .. ", " .. utopiaValue(v.ElasticityWeight) .. ")"
+		end
+		if tv == "Random" then return "Random.new()" end
+		if tv == "Ray" then return "Ray.new(" .. utopiaValue(v.Origin) .. ", " .. utopiaValue(v.Direction) .. ")" end
+		if tv == "RaycastParams" then
+			return "--[[typeof: RaycastParams ->]] {FilterDescendantsInstances = " .. utopiaValue(v.FilterDescendantsInstances) .. ", FilterType = "
+				.. utopiaValue(v.FilterType) .. ", IgnoreWater = " .. utopiaValue(v.IgnoreWater) .. ", CollisionGroup = '" .. tostring(v.CollisionGroup) .. "'}"
+		end
+		if tv == "RaycastResult" then
+			return "--[[typeof: RaycastResult ->]] {Distance = " .. utopiaValue(v.Distance) .. ", Instance = " .. utopiaValue(v.Instance)
+				.. ", Material = " .. utopiaValue(v.Material) .. ", Position = " .. utopiaValue(v.Position) .. ", Normal = " .. utopiaValue(v.Normal) .. "}"
+		end
+		if tv == "RBXScriptConnection" then return "--[[typeof: RBXScriptConnection ->]] {Connected = " .. utopiaValue(v.Connected) .. "}" end
+		if tv == "RBXScriptSignal" then return "RBXScriptSignal" end
+		if tv == "Rect" then return "Rect.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
+		if tv == "Region3" then
+			local cf, sz = v.CFrame, v.Size
+			return "Region3.new(" .. utopiaValue((cf * CFrame.new(-sz.X / 2, -sz.Y / 2, -sz.Z / 2)).p) .. ", "
+				.. utopiaValue((cf * CFrame.new(sz.X / 2, sz.Y / 2, sz.Z / 2)).p) .. ")"
+		end
+		if tv == "Region3int16" then return "Region3int16.new(" .. utopiaValue(v.Min) .. ", " .. utopiaValue(v.Max) .. ")" end
+		if tv == "OverlapParams" then
+			return "--[[typeof: OverlapParams ->]] {FilterDescendantsInstances = " .. utopiaValue(v.FilterDescendantsInstances) .. ", FilterType = "
+				.. utopiaValue(v.FilterType) .. ", MaxParts =" .. utopiaValue(v.MaxParts) .. ", CollisionGroup = " .. utopiaValue(v.CollisionGroup) .. "}"
+		end
+		if tv == "userdata" then return "newproxy(true)" end
+		if v == nil then return "nil" end
+		return tostring(v)
+	end
+
+	local function utopiaGuard(f, ...)
+		utopiaDepth, utopiaCount = 0, 0
+		local ok, res = pcall(f, ...)
+		utopiaDepth, utopiaCount = 0, 0
+		if ok then return res end
+		return "nil --[[ UtopiaSpy: could not serialize: " .. safeComment(res) .. " ]]"
+	end
+
+	-- the recorded args table (pack(...)) as a `table.unpack({...}, 1, n)` argument
+	local function utopiaArgsTable(args)
+		local rows = {"{"}
+		for i = 1, args.n do
+			rows[#rows + 1] = "\n    [" .. i .. "] = " .. utopiaGuard(utopiaValue, args[i]) .. ","
+		end
+		return table.concat(rows) .. "\n}"
+	end
+
+	-- convert_to_code (outgoing: FireServer / InvokeServer)
+	local function utopiaOut(remote, args, method)
+		local r = utopiaGuard(utopiaValue, remote)
+		if args.n == 0 then return r .. ":" .. method .. "()" end
+		if args.n == 1 then return r .. ":" .. method .. "(" .. utopiaGuard(utopiaValue, args[1]) .. ")" end
+		return r .. ":" .. method .. "(table.unpack(" .. utopiaArgsTable(args) .. ", 1, " .. args.n .. "))"
+	end
+
+	-- convert_to_code_client (incoming: FireClient / InvokeClient)
+	local function utopiaIn(remote, args, method)
+		local r = utopiaGuard(utopiaValue, remote)
+		local lm = method:lower()
+		local a
+		if args.n == 0 then a = ""
+		elseif args.n == 1 then a = utopiaGuard(utopiaValue, args[1])
+		else a = "table.unpack(" .. utopiaArgsTable(args) .. ", 1, " .. args.n .. ")" end
+		if lm == "fireclient" or lm == "onclientevent" then
+			return "local Remote = " .. r .. "\nfiresignal(Remote.OnClientEvent" .. (a ~= "" and (", " .. a) or "") .. ")"
+		elseif lm == "invokeclient" then
+			return "local Remote = " .. r .. '\nlocal callback = getcallbackmember(Remote, "OnClientInvoke")\ncallback(' .. a .. ")"
+		end
+		return "-- Unknown ncm for client: " .. method
+	end
+
+	-- [SPIES:UTOPIA-CODEGEN] entry point used by the UtopiaSpy tab (Copy Code / detail view)
+	local function utopiaCode(e)
+		if e.dir == "in" then return utopiaIn(e.remote, e.args, e.method) end
+		return utopiaOut(e.remote, e.args, e.method)
+	end
+
+	---------------------------------------------------------------------
+	-- Remote engine (shared by UtopiaSpy + Cobalt)
 	---------------------------------------------------------------------
 	local Remote = {
 		installed = false,
@@ -11618,7 +12849,7 @@ local function main()
 		incoming = true, bindables = false, trace = true,
 		blocked = {}, simpleIgnored = {}, cobaltIgnored = {},
 		inCall = setmetatable({}, {__mode = "k"}),
-		incomingCons = {}, incomingConnected = false,
+		incomingCons = {}, incomingConnected = false, cbHooked = setmetatable({}, {__mode = "k"}),
 		counter = 0,
 	}
 	local OUT = {FireServer = true, fireServer = true, InvokeServer = true, invokeServer = true}
@@ -11690,7 +12921,7 @@ local function main()
 			return unpack(r, 1, r.n)
 		end
 
-		-- [SPIES:NAMECALL-HOOK] the single global __namecall hook used by SimpleSpy + Cobalt tabs.
+		-- [SPIES:NAMECALL-HOOK] the single global __namecall hook used by UtopiaSpy + Cobalt tabs.
 		-- How it is installed (hookmetamethod, newcclosure wrapper) is decided here.
 		local oldNC
 		oldNC = hookmm(game, "__namecall", newcc(function(self, ...)
@@ -11731,13 +12962,41 @@ local function main()
 		return true
 	end
 
+	local function incomingWanted(r)
+		if not Remote.incoming then return false end
+		return (Remote.cobalt and not Remote.cobaltIgnored[r]) or (Remote.simple and not Remote.simpleIgnored[r]) or false
+	end
+
+	-- [SPIES:UTOPIA-CLIENTINVOKE] logs server -> client RemoteFunction calls (OnClientInvoke) like UtopiaSpy does.
+	-- Needs getcallbackmember + hookfunction; switch off with Spies.Utopia.invokeClientHook = false.
+	local function hookClientInvoke(rf)
+		local gcm, hookf = G("getcallbackmember"), G("hookfunction")
+		if not (Utopia.invokeClientHook and gcm and hookf) then return end
+		local newcc = G("newcclosure") or function(f) return f end
+		local function hookCb()
+			local ok, cb = pcall(gcm, rf, "OnClientInvoke")
+			if not ok or type(cb) ~= "function" or Remote.cbHooked[cb] then return end
+			local old
+			local ok2, res = pcall(hookf, cb, newcc(function(...)
+				if Remote.simple and Remote.incoming then
+					recordRemote("in", rf, rf.ClassName, "InvokeClient", pack(...))
+				end
+				return old(...)
+			end))
+			if ok2 then old = res Remote.cbHooked[cb] = true end
+		end
+		hookCb()
+		local okc, con = pcall(function() return rf:GetPropertyChangedSignal("OnClientInvoke"):Connect(hookCb) end)
+		if okc and con then table.insert(Remote.incomingCons, con) end
+	end
+
 	local function connectIncoming()
 		if Remote.incomingConnected then return end
 		Remote.incomingConnected = true
 		local function hookRemote(r)
 			local ok, con = pcall(function()
 				return r.OnClientEvent:Connect(function(...)
-					if Remote.cobalt and Remote.incoming and not Remote.cobaltIgnored[r] then
+					if incomingWanted(r) then
 						recordRemote("in", r, r.ClassName, "OnClientEvent", pack(...))
 					end
 				end)
@@ -11745,10 +13004,12 @@ local function main()
 			if ok and con then table.insert(Remote.incomingCons, con) end
 		end
 		for _, d in ipairs(game:GetDescendants()) do
-			if d:IsA("BaseRemoteEvent") then hookRemote(d) end
+			if d:IsA("BaseRemoteEvent") then hookRemote(d)
+			elseif d.ClassName == "RemoteFunction" then pcall(hookClientInvoke, d) end
 		end
 		Remote.descCon = game.DescendantAdded:Connect(function(d)
-			if d:IsA("BaseRemoteEvent") then hookRemote(d) end
+			if d:IsA("BaseRemoteEvent") then hookRemote(d)
+			elseif d.ClassName == "RemoteFunction" then pcall(hookClientInvoke, d) end
 		end)
 	end
 
@@ -11778,7 +13039,7 @@ local function main()
 		return "nil"
 	end
 
-	local function remoteDetail(e, full)
+	local function remoteDetail(e, full, style)
 		local out = {}
 		out[#out + 1] = "-- Remote:  " .. pathOf(e.remote)
 		out[#out + 1] = "-- Class:   " .. e.class .. "   Method: " .. e.method .. "   Time: " .. e.clock
@@ -11791,7 +13052,7 @@ local function main()
 			out[#out + 1] = "-- Return: (still pending / errored)"
 		end
 		out[#out + 1] = ""
-		out[#out + 1] = genRemoteCode(e)
+		out[#out + 1] = (style == "utopia") and utopiaCode(e) or genRemoteCode(e)
 		if full and e.trace and e.trace ~= "" then
 			out[#out + 1] = ""
 			out[#out + 1] = "--[[ traceback"
@@ -11811,6 +13072,8 @@ local function main()
 	local function buildRemotePanel(kind)
 		local isCobalt = kind == "cobalt"
 		local ignoredSet = isCobalt and Remote.cobaltIgnored or Remote.simpleIgnored
+		local flag = isCobalt and "cobalt" or "simple"
+		local gen = isCobalt and genRemoteCode or utopiaCode -- UtopiaSpy tab = UtopiaSpy code generator
 		local P
 
 		local function sel() return P.selected and P.selected.Data end
@@ -11819,32 +13082,42 @@ local function main()
 			if not e then P.setDetail("-- select a call first") end
 			return e
 		end
+		local function copyOrShow(text)
+			if not copyText(text) then P.setDetail("-- executor has no setclipboard; copy the code from this box\n\n" .. text) end
+		end
+		-- all recorded calls (still in the list) of the same remote as `e`, oldest first
+		local function callsOf(e)
+			local list = {}
+			for _, row in ipairs(P.rows) do
+				if row.Data.remote == e.remote then list[#list + 1] = row.Data end
+			end
+			return list
+		end
 
 		local buttons = {}
 		local function add(text, width, fn, init) buttons[#buttons + 1] = {text, width, fn, init} end
 
 		add("Enable: OFF", 84, function(btn)
-			local flag = isCobalt and "cobalt" or "simple"
 			if not Remote[flag] then
 				local ok, err = installRemote()
 				if not ok then P.setDetail("-- cannot enable: " .. tostring(err)) return end
 				Remote[flag] = true
-				if isCobalt and Remote.incoming then connectIncoming() end
+				if Remote.incoming then connectIncoming() end
 			else
 				Remote[flag] = false
-				if isCobalt then disconnectIncoming() end
+				if not (Remote.cobalt or Remote.simple) then disconnectIncoming() end
 			end
 			btn.Text = toggleText("Enable", Remote[flag])
-		end, function(btn) btn.Text = toggleText("Enable", Remote[isCobalt and "cobalt" or "simple"]) end)
+		end, function(btn) btn.Text = toggleText("Enable", Remote[flag]) end)
 
+		add("Incoming: ON", 86, function(btn)
+			Remote.incoming = not Remote.incoming
+			if Remote.cobalt or Remote.simple then
+				if Remote.incoming then connectIncoming() else disconnectIncoming() end
+			end
+			btn.Text = toggleText("Incoming", Remote.incoming)
+		end, function(btn) btn.Text = toggleText("Incoming", Remote.incoming) end)
 		if isCobalt then
-			add("Incoming: ON", 86, function(btn)
-				Remote.incoming = not Remote.incoming
-				if Remote.cobalt then
-					if Remote.incoming then connectIncoming() else disconnectIncoming() end
-				end
-				btn.Text = toggleText("Incoming", Remote.incoming)
-			end, function(btn) btn.Text = toggleText("Incoming", Remote.incoming) end)
 			add("Bindables: OFF", 94, function(btn)
 				Remote.bindables = not Remote.bindables
 				btn.Text = toggleText("Bindables", Remote.bindables)
@@ -11857,8 +13130,33 @@ local function main()
 
 		add("Copy Code", 70, function()
 			local e = needSel() if not e then return end
-			if not copyText(genRemoteCode(e)) then P.setDetail("-- executor has no setclipboard; copy the code from this box\n\n" .. genRemoteCode(e)) end
+			copyOrShow(gen(e))
 		end)
+		if not isCobalt then
+			-- UtopiaSpy per-remote copy buttons
+			add("Copy last x10", 94, function()
+				local e = needSel() if not e then return end
+				local calls, out = callsOf(e), {}
+				for i = math.max(1, #calls - 9), #calls do out[#out + 1] = gen(calls[i]) end
+				copyOrShow(table.concat(out, "\n\n"))
+			end)
+			add("Copy all", 70, function()
+				local e = needSel() if not e then return end
+				local out = {}
+				for _, c in ipairs(callsOf(e)) do out[#out + 1] = gen(c) end
+				copyOrShow(table.concat(out, "\n\n"))
+			end)
+			add("Get Return", 82, function()
+				local e = needSel() if not e then return end
+				if e.ret then
+					P.setDetail("-- Return values of this call (" .. e.ret.n .. "):\n" .. utopiaArgsTable(e.ret))
+				elseif e.method:lower() == "invokeserver" then
+					P.setDetail("-- no return value captured (call blocked, still pending, or it errored)")
+				else
+					P.setDetail("-- " .. e.method .. " has no return value")
+				end
+			end)
+		end
 		add(isCobalt and "Replay" or "Run", 56, function()
 			local e = needSel() if not e then return end
 			replayRemote(e)
@@ -11882,6 +13180,14 @@ local function main()
 			ignoredSet[e.remote] = true
 			P.setDetail("-- ignoring " .. e.name .. " (use Reset to undo)")
 		end)
+		if not isCobalt then
+			-- UtopiaSpy blacklistedNames: hide every remote with this NAME (also remotes created later)
+			add("Ignore Name", 90, function()
+				local e = needSel() if not e then return end
+				if not table.find(Utopia.blacklistedNames, e.name) then table.insert(Utopia.blacklistedNames, e.name) end
+				P.setDetail("-- \"" .. e.name .. "\" added to blacklistedNames (use Reset to undo)")
+			end)
+		end
 		add("Block", 52, function(btn)
 			local e = needSel() if not e then return end
 			Remote.blocked[e.remote] = not Remote.blocked[e.remote] or nil
@@ -11890,29 +13196,32 @@ local function main()
 		add("Reset", 52, function()
 			table.clear(ignoredSet)
 			table.clear(Remote.blocked)
+			if not isCobalt then table.clear(Utopia.blacklistedNames) end
 			P.setDetail("-- cleared ignored / blocked lists")
 		end)
 		add("Clear", 52, function() P.clear() end)
 
 		P = makePanel({
-			name = isCobalt and "Cobalt" or "SimpleSpy",
+			name = isCobalt and "Cobalt" or "UtopiaSpy",
 			buttons = buttons,
 			hint = (isCobalt and "-- Cobalt: outgoing + incoming remote traffic, return values, calling script, traceback.\n"
-				or "-- SimpleSpy: outgoing remote calls with copy-pasteable code.\n")
+				or "-- UtopiaSpy: outgoing FireServer / InvokeServer + incoming OnClientEvent / OnClientInvoke,\n-- UtopiaSpy-style code (Remote:FireServer(table.unpack({...})), function dumps, utf8.char names).\n")
 				.. "-- Press Enable, then do something in the game. Click a call to see the generated code.\n"
-				.. "-- Needs hookmetamethod + getnamecallmethod (hookfunction/getcallingscript/firesignal improve it).",
+				.. "-- Needs hookmetamethod + getnamecallmethod (hookfunction/getcallingscript/firesignal/getcallbackmember improve it).\n"
+				.. (isCobalt and "" or "-- Settings (blacklistedNames, maxTableDepth, newFunctionMethod, ...): search for [SPIES:UTOPIA] in the Spies module."),
 		})
 		if isCobalt then Spies.CobaltPanel = P else Spies.SimplePanel = P end
 		return P
 	end
 
 	dispatchRemote = function(e)
-		local function show(P, ignored, full)
+		local function show(P, ignored, full, style)
 			if ignored[e.remote] then return end
+			if style == "utopia" and table.find(Utopia.blacklistedNames, e.name) then return end
 			local color = e.blocked and COL_BLOCK or (e.dir == "in" and COL_IN or COL_OUT)
-			P.addRow(remoteRowText(e), color, e, function(row) P.setDetail(remoteDetail(row.Data, full)) end)
+			P.addRow(remoteRowText(e), color, e, function(row) P.setDetail(remoteDetail(row.Data, full, style)) end)
 		end
-		if e.dir ~= "in" and Remote.simple and Spies.SimplePanel then show(Spies.SimplePanel, Remote.simpleIgnored, false) end
+		if Remote.simple and Spies.SimplePanel and (e.dir ~= "in" or Remote.incoming) then show(Spies.SimplePanel, Remote.simpleIgnored, false, "utopia") end
 		if Remote.cobalt and Spies.CobaltPanel then show(Spies.CobaltPanel, Remote.cobaltIgnored, true) end
 	end
 
@@ -12513,6 +13822,2897 @@ local function main()
 		return P
 	end
 
+	-- [SPIES:UTOPIA-SRC] full UtopiaSpy script (Made by UtopiaTM), embedded unchanged; run by the Originals tab.
+	local UTOPIA_SRC = [==[
+-- Деобфусцировано из MoonSec V3: VM снята -> Lua 5.1 байткод -> unluac-rs
+-- Поведение лифтнутого байткода сверено с оригиналом в песочнице (одинаковые вызовы API).
+-- Имена локальных переменных в VM не хранятся, поэтому они вида rN_M / pN_M.
+
+local r0_0 = true
+if not game.IsLoaded(game) then
+    repeat
+        task.wait()
+    until game.IsLoaded(game)
+    r0_0 = false
+end
+local r0_1 = { ... }
+r0_1 = r0_1[1]
+if not r0_1 then
+    r0_1 = {}
+end
+local r0_2 = tick()
+local r0_3 = setmetatable
+local r0_4 = {}
+local r0_5 = {}
+
+function r0_5.__index(p51_0, p51_1) -- proto#51 params=2 locals=1 upvalues=0 vararg=false source=@moonsec
+    return game.GetService(game, p51_1)
+end
+
+local r0_6 = r0_3(r0_4, r0_5)
+if not decompile and not disassemble then
+    local function r0_7() -- proto#49 params=0 locals=0 upvalues=0 vararg=false source=@moonsec
+        return "-- Decompiler not found."
+    end
+end
+
+function r0_5(p4_0) -- proto#4 params=1 locals=4 upvalues=0 vararg=false source=@moonsec
+    if setclipboard then
+        setclipboard("" .. tostring(p4_0))
+    else
+        print("Couldn't setclipboard.")
+    end
+end
+
+if (not syn or not syn.set_thread_identity) and not setidentity then
+    local r0_8 = setthreadcontext
+end
+local r0_9 = syn and syn.toast_notification ~= nil
+local r0_10 = r0_6.Players.LocalPlayer
+local r0_11 = r0_10:GetMouse()
+local r0_12 = {}
+r0_12.VERSION = "Made by UtopiaTM"
+local r0_13 = {}
+r0_12.Connections = r0_13
+r0_13 = {}
+r0_12.guiConnections = r0_13
+r0_13 = {}
+r0_12.instances = r0_13
+r0_13 = {}
+r0_12.blocked = r0_13
+r0_13 = {}
+r0_12.ignored = r0_13
+r0_12.currentTableDepth = 0
+r0_13 = r0_1.saveCalls
+r0_13 = r0_13 or true
+r0_12.saveCalls = r0_13
+r0_13 = r0_1.saveOnlyLastCall
+r0_13 = r0_13 or false
+r0_12.saveOnlyLastCall = r0_13
+r0_13 = r0_1.maxTableDepth
+r0_13 = r0_13 or 100
+r0_12.maxTableDepth = r0_13
+r0_13 = r0_1.maxCallsSaved
+r0_13 = r0_13 or 1000
+r0_12.maxCallsSaved = r0_13
+local r0_14 = r0_1.minimizeBind or Enum.KeyCode.RightAlt
+r0_12.minimizeBind = r0_14
+r0_14 = r0_1.newFunctionMethod
+r0_14 = r0_14 or true
+r0_12.newFunctionMethod = r0_14
+local r0_15 = {}
+r0_15.RemoteEvent = "http://www.roblox.com/asset/?id=413369506"
+r0_15.RemoteFunction = "http://www.roblox.com/asset/?id=413369623"
+r0_12.assets = r0_15
+r0_15 = Instance
+r0_15 = r0_15.new
+r0_15 = r0_15("BindableEvent")
+r0_12.event = r0_15
+r0_15 = r0_1.blacklistedNames
+r0_15 = r0_15 or {}
+r0_12.blacklistedNames = r0_15
+r0_15 = shared
+r0_15.UtopiaSpy = r0_12
+r0_15 = getgenv
+if r0_15 then
+    local r0_16 = getgenv()
+    r0_16.UtopiaSpy = r0_12
+end
+local r0_17 = nil
+local r0_18 = nil
+local r0_19 = false
+
+local function r0_20(p1_0, p1_1, p1_2) -- proto#1 params=3 locals=3 upvalues=1 vararg=false source=@moonsec
+    local r1_0 = Instance.new(p1_1)
+    for r1_1, r1_2 in next, p1_2 do
+        r1_0[r1_1] = r1_2
+    end
+    r0_12.instances[r1_0.Name] = r1_0
+    return r1_0
+end
+
+r0_12.newInstance = r0_20
+r0_20 = r0_12.newInstance
+r0_12.createInstance = r0_20
+
+function r0_20(p14_0) -- proto#14 params=1 locals=4 upvalues=1 vararg=false source=@moonsec
+    for r14_0, r14_1 in next, r0_12.instances do
+        r14_1:Destroy()
+        r0_12.Connections[r14_0] = nil
+    end
+    for r14_2, r14_3 in next, r0_12.guiConnections do
+        r14_3:Disconnect()
+        r0_12.guiConnections[r14_2] = nil
+    end
+    r0_12.unhook()
+    r0_12 = nil
+end
+
+r0_12.Destroy = r0_20
+
+local function r0_21(p15_0) -- proto#15 params=1 locals=3 upvalues=0 vararg=false source=@moonsec
+    local r15_0 = ":()[]{}+_-=\\|`~,.<>/?!@#$%^&*"
+    for r15_1 in string.gmatch(p15_0, "([%z\001-\127\194-\244][\128-\191]*)") do
+        if r15_0:find(r15_1) then
+            return true
+        end
+    end
+end
+
+local function r0_22(p2_0) -- proto#2 params=1 locals=4 upvalues=0 vararg=false source=@moonsec
+    local r2_0 = "utf8.char("
+    for r2_1, r2_2 in utf8.codes(p2_0) do
+        local r2_3 = r2_0
+        r2_0 = r2_3 .. r2_2 .. ", "
+    end
+    return r2_0:sub(1, -3) .. ")"
+end
+
+local function r0_23(p48_0) -- proto#48 params=1 locals=2 upvalues=0 vararg=false source=@moonsec
+    return (p48_0:gsub("\000", "\\0"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t"):gsub("\011", "\\v"):gsub("\008", "\\b"):gsub("\012", "\\f"))
+end
+
+local function r0_24(p6_0) -- proto#6 params=1 locals=4 upvalues=3 vararg=false source=@moonsec
+    local r6_0, r6_1
+    repeat
+        r6_0 = p6_0.Name
+        if #r6_0 > 0 then
+            local r6_2 = "." .. r6_0
+            if r6_2 then
+                r6_1 = r6_2
+                break
+            end
+        end
+        r6_1 = "['']"
+    until true
+    if not p6_0.Parent and p6_0 ~= game then
+        return r6_1 .. " --[[ Parented to nil ]]"
+    end
+    if p6_0 == game then
+        return "game"
+    end
+    if p6_0 == workspace then
+        return "workspace"
+    end
+    local r6_3, r6_4 = pcall(game.GetService, game, p6_0.ClassName)
+    local r6_5
+    if r6_3 and r6_4 then
+        r6_5 = ':GetService("' .. p6_0.ClassName .. '")'
+    elseif p6_0 == r0_10 then
+        r6_5 = ".LocalPlayer"
+    elseif tonumber(r6_0:sub(1, 1))
+        or #r6_0:gsub("[%w_]", "") ~= 0 and #r6_0:gsub("[%w_]", ""):gsub("[%s%p]", "") == 0 then
+        r6_5 = '["' .. r6_0:gsub('"', '\\"'):gsub("\\", "\\\\") .. '"]'
+    elseif #r6_0:gsub("[%w_]", "") ~= 0 and #r6_0:gsub("[%w_]", ""):gsub("[%s%p]", "") > 0 then
+        r6_5 = "[" .. r0_22(r6_0) .. "]"
+    else
+        r6_5 = r6_1
+    end
+    r6_3 = r0_12
+    r6_3 = r6_3.get_path
+    r6_4 = p6_0.Parent
+    r6_3 = r6_3(r6_4)
+    r6_4 = r6_5
+    r6_3 = r6_3 .. r6_4
+    return r6_3
+end
+
+r0_12.get_path = r0_24
+
+local function r0_25(p67_0) -- proto#67 params=1 locals=21 upvalues=1 vararg=false source=@moonsec
+    r0_12.currentTableDepth = r0_12.currentTableDepth + 1
+    local r67_0 = r0_12.currentTableDepth
+    if r0_12.maxTableDepth + 1 < r67_0 then
+        r0_12.currentTableDepth = r0_12.currentTableDepth - 1
+        local r67_1 = tostring(p67_0)
+        return "table_over_maxTableDepth (.." .. r67_1 .. ")"
+    end
+    local r67_2 = "{"
+    local r67_3, r67_4 = next, p67_0
+    for r67_5, r67_6 in r67_3, r67_4, nil do
+        local r67_7 = r67_2
+        r67_2 = r67_7 .. "\n" .. ("    "):rep(r0_12.currentTableDepth) .. "["
+            .. r0_12.get_real_value(r67_5) .. "] = " .. r0_12.get_real_value(r67_6) .. ","
+    end
+    r67_4 = r67_2
+    if r67_4:sub(-2) == ", " then
+        r67_2 = r67_2:sub(1, -3)
+    end
+    r0_12.currentTableDepth = r0_12.currentTableDepth - 1
+    r67_3 = r67_2
+    return r67_3 .. "\n" .. ("    "):rep(r0_12.currentTableDepth) .. "}"
+end
+
+r0_12.table_to_string = r0_25
+
+local function r0_26(p5_0) -- proto#5 params=1 locals=1 upvalues=0 vararg=false source=@moonsec
+    local r5_0 = debug.getinfo(p5_0)
+    r5_0.func = nil
+    return r5_0
+end
+
+r0_12.bettergetinfo = r0_26
+
+local function r0_27(p66_0) -- proto#66 params=1 locals=191 upvalues=2 vararg=false source=@moonsec
+    local r66_0 = typeof(p66_0)
+    if r66_0 == "Instance" then
+        return r0_12.get_path(p66_0)
+    end
+    if r66_0 == "string" then
+        local r66_1 = r0_23(p66_0)
+        return '"' .. r66_1 .. '"'
+    end
+    if r66_0 == "table" then
+        return r0_12.table_to_string(p66_0)
+    end
+    if r66_0 == "function" then
+        if islclosure(p66_0) then
+            if r0_12.newFunctionMethod then
+                local r66_2 = "--[[function -->]] "
+                local r66_3 = r0_12.table_to_string
+                local r66_4 = {}
+                r66_4.upvalues = debug.getupvalues(p66_0)
+                r66_4.constants = debug.getconstants(p66_0)
+                r66_4.protos = debug.getprotos(p66_0)
+                r66_4.info = r0_12.bettergetinfo(p66_0)
+                r66_3 = r66_3(r66_4)
+                return r66_2 .. r66_3
+            end
+            return "function() end"
+        end
+        return "newcclosure(function() end)"
+    end
+    if not (r66_0 == "UDim2"
+        or r66_0 == "UDim"
+        or r66_0 == "Vector3"
+        or r66_0 == "Vector2"
+        or r66_0 == "CFrame"
+        or r66_0 == "Vector2int16"
+        or r66_0 == "Vector3int16"
+        or r66_0 == "BrickColor"
+        or r66_0 == "Color3") then
+        if r66_0 == "TweenInfo" then
+            return "TweenInfo.new(" .. r0_12.get_real_value(p66_0.Time) .. ", "
+                .. r0_12.get_real_value(p66_0.EasingStyle) .. ", "
+                .. r0_12.get_real_value(p66_0.EasingDirection) .. ", "
+                .. r0_12.get_real_value(p66_0.RepeatCount) .. ", "
+                .. r0_12.get_real_value(p66_0.Reverses) .. ", "
+                .. r0_12.get_real_value(p66_0.DelayTime) .. ")"
+        end
+        if r66_0 == "Enums" then
+            return "Enum"
+        end
+        if r66_0 == "Enum" then
+            return "Enum." .. tostring(p66_0)
+        end
+        if not (r66_0 == "Axes" or r66_0 == "Faces") then
+            if r66_0 == "ColorSequence" then
+                local r66_5 = "ColorSequence.new{"
+                local r66_6 = p66_0.Keypoints
+                local r66_7 = next
+                local r66_8 = r66_6
+                for r66_9, r66_10 in r66_7, r66_8, nil do
+                    local r66_11 = r66_5
+                    r66_5 = r66_11 .. r0_12.get_real_value(r66_10) .. ", "
+                end
+                r66_8 = r66_5
+                return r66_8:sub(1, -3) .. "}"
+            end
+            if r66_0 == "ColorSequenceKeypoint" then
+                return "ColorSequenceKeypoint.new(" .. tostring(p66_0.Time) .. ", "
+                    .. r0_12.get_real_value(p66_0.Value) .. ")"
+            end
+            if r66_0 == "DockWidgetPluginGuiInfo" then
+                local r66_12 = ""
+                local r66_13 = tostring(p66_0):split(":")
+                local r66_14 = next
+                local r66_15 = r66_13
+                for r66_16, r66_17 in r66_14, r66_15, nil do
+                    local r66_18 = r66_12
+                    r66_12 = r66_18 .. r66_17 .. " "
+                end
+                r66_15 = r66_12
+                local r66_19 = r66_15:split(" ")
+                local r66_20, r66_21 = "", 0
+                local r66_22 = next
+                for r66_23, r66_24 in r66_22, r66_19, nil do
+                    if math.floor(r66_23 / 2) == r66_23 / 2 and r66_24 ~= " " then
+                        r66_21 = r66_21 + 1
+                        local r66_25 = r66_24
+                        if r66_21 == 1 then
+                            r66_25 = "Enum.InitialDockState." .. r66_24
+                        end
+                        local r66_26 = r66_20
+                        local r66_27 = r66_25
+                        r66_20 = r66_26 .. r66_27 .. ", "
+                    end
+                end
+                local r66_28 = r66_20:sub(1, -3)
+                return "DockWidgetPluginGuiInfo.new(" .. r66_28 .. ")"
+            end
+            if r66_0 == "DateTime" then
+                local r66_29 = p66_0.UnixTimestampMillis
+                local r66_30 = DateTime.now()
+                r66_30 = r66_30.UnixTimestampMillis
+                if r66_29 == r66_30 then
+                    return "DateTime.now()"
+                end
+                local r66_31 = p66_0.UnixTimestampMillis
+                return "DateTime.fromUnixTimestampMillis(" .. r66_31 .. ")"
+            end
+            if r66_0 == "FloatCurveKey" then
+                return "FloatCurveKey.new(" .. r0_12.get_real_value(p66_0.Time) .. ", "
+                    .. r0_12.get_real_value(p66_0.Value) .. ", "
+                    .. r0_12.get_real_value(p66_0.Interpolation) .. ")"
+            end
+            if r66_0 == "NumberRange" then
+                return "NumberRange.new(" .. r0_12.get_real_value(p66_0.Min) .. ", "
+                    .. r0_12.get_real_value(p66_0.Max) .. ")"
+            end
+            if r66_0 == "NumberSequence" then
+                local r66_32 = "NumberSequence.new{"
+                local r66_33 = p66_0.Keypoints
+                local r66_34 = next
+                local r66_35 = r66_33
+                for r66_36, r66_37 in r66_34, r66_35, nil do
+                    local r66_38 = r66_32
+                    r66_32 = r66_38 .. r0_12.get_real_value(r66_37) .. ", "
+                end
+                r66_35 = r66_32
+                return r66_35:sub(1, -3) .. "}"
+            end
+            if r66_0 == "NumberSequenceKeypoint" then
+                local r66_39, r66_40, r66_41, r66_42, r66_43
+                repeat
+                    r66_39 = "NumberSequenceKeypoint.new("
+                    r66_40 = tostring(p66_0.Time)
+                    r66_41 = ", "
+                    r66_42 = r0_12.get_real_value(p66_0.Value)
+                    if p66_0.Envelope then
+                        local r66_44 = ", " .. p66_0.Envelope
+                        if r66_44 then
+                            r66_43 = r66_44
+                            break
+                        end
+                    end
+                    r66_43 = ""
+                until true
+                return r66_39 .. r66_40 .. r66_41 .. r66_42 .. r66_43 .. ")"
+            end
+            if r66_0 == "PathWaypoint" then
+                return "PathWaypoint.new(" .. r0_12.get_real_value(p66_0.Position) .. ", "
+                    .. r0_12.get_real_value(p66_0.Action) .. ")"
+            end
+            if r66_0 == "PhysicalProperties" then
+                return "PhysicalProperties.new(" .. r0_12.get_real_value(p66_0.Density) .. ", "
+                    .. r0_12.get_real_value(p66_0.Friction) .. ", "
+                    .. r0_12.get_real_value(p66_0.Elasticity) .. ", "
+                    .. r0_12.get_real_value(p66_0.FrictionWeight) .. ", "
+                    .. r0_12.get_real_value(p66_0.ElasticityWeight) .. ")"
+            end
+            if r66_0 == "Random" then
+                return "Random.new()"
+            end
+            if r66_0 == "Ray" then
+                return "Ray.new(" .. r0_12.get_real_value(p66_0.Origin) .. ", "
+                    .. r0_12.get_real_value(p66_0.Direction) .. ")"
+            end
+            if r66_0 == "RaycastParams" then
+                return "--[[typeof: RaycastParams ->]] {FilterDescendantsInstances = "
+                    .. r0_12.get_real_value(p66_0.FilterDescendantsInstances) .. ", FilterType = "
+                    .. r0_12.get_real_value(p66_0.FilterType) .. ", IgnoreWater = "
+                    .. r0_12.get_real_value(p66_0.IgnoreWater) .. ", CollisionGroup = '"
+                    .. r0_12.get_real_value(p66_0.CollisionGroup) .. "'}"
+            end
+            if r66_0 == "RaycastResult" then
+                return "--[[typeof: RaycastResult ->]] {Distance = "
+                    .. r0_12.get_real_value(p66_0.Distance) .. ", Instance = "
+                    .. r0_12.get_real_value(p66_0.Instance) .. ", Material = "
+                    .. r0_12.get_real_value(p66_0.Material) .. ", Position = "
+                    .. r0_12.get_real_value(p66_0.Position) .. ", Normal = "
+                    .. r0_12.get_real_value(p66_0.Normal) .. "}"
+            end
+            if r66_0 == "RBXScriptConnection" then
+                return "--[[typeof: RBXScriptConnection ->]] {Connected = "
+                    .. r0_12.get_real_value(p66_0.Connected) .. "}"
+            end
+            if r66_0 == "RBXScriptSignal" then
+                return "RBXScriptSignal"
+            end
+            if r66_0 == "Rect" then
+                return "Rect.new(" .. r0_12.get_real_value(p66_0.Min) .. ", "
+                    .. r0_12.get_real_value(p66_0.Max) .. ")"
+            end
+            if r66_0 == "Region3" then
+                local r66_45 = p66_0.CFrame
+                local r66_46 = p66_0.Size
+                local r66_47 = r0_12.get_real_value((r66_45
+                    * CFrame.new(-r66_46.X / 2, -r66_46.Y / 2, -r66_46.Z / 2)).p)
+                local r66_48 = r0_12.get_real_value((r66_45
+                    * CFrame.new(r66_46.X / 2, r66_46.Y / 2, r66_46.Z / 2)).p)
+                return "Region3.new(" .. r66_47 .. ", " .. r66_48 .. ")"
+            end
+            if r66_0 == "Region3int16" then
+                return "Region3int16.new(" .. r0_12.get_real_value(p66_0.Min) .. ", "
+                    .. r0_12.get_real_value(p66_0.Max) .. ")"
+            end
+            if r66_0 == "CatalogSearchParams" then
+                return "--[[typeof: CatalogSearchParams ->]] {SearchKeyword = "
+                    .. r0_12.get_real_value(p66_0.SearchKeyword) .. ", MinPrice = "
+                    .. r0_12.get_real_value(p66_0.MinPrice) .. ", MaxPrice = "
+                    .. r0_12.get_real_value(p66_0.MaxPrice) .. ", SortType = "
+                    .. r0_12.get_real_value(p66_0.SortType) .. ", CategoryFilter = "
+                    .. r0_12.get_real_value(p66_0.CategoryFilter) .. ", AssetTypes = "
+                    .. r0_12.get_real_value(p66_0.AssetTypes) .. "}"
+            end
+            if r66_0 == "OverlapParams" then
+                return "--[[typeof: OverlapParams ->]] {FilterDescendantsInstances = "
+                    .. r0_12.get_real_value(p66_0.FilterDescendantsInstances) .. ", FilterType = "
+                    .. r0_12.get_real_value(p66_0.FilterType) .. ", MaxParts ="
+                    .. r0_12.get_real_value(p66_0.MaxParts) .. ", CollisionGroup = "
+                    .. r0_12.get_real_value(p66_0.CollisionGroup) .. "}"
+            end
+            if r66_0 == "userdata" then
+                return "newproxy(true)"
+            end
+            if p66_0 == nil then
+                return "nil"
+            end
+            return tostring(p66_0)
+        end
+        local r66_49 = r66_0 .. ".new("
+        local r66_50 = Enum.NormalId:GetEnumItems()
+        local r66_51 = next
+        local r66_52 = r66_50
+        for r66_53, r66_54 in r66_51, r66_52, nil do
+            if p66_0[r66_54.Name] then
+                local r66_55 = r66_49
+                r66_49 = r66_55 .. r0_12.get_real_value(r66_54) .. ", "
+            end
+        end
+        r66_52 = r66_49
+        return r66_52:sub(1, -3) .. ")"
+    end
+    local r66_56 = r66_0 == "BrickColor" and "'" .. tostring(p66_0) .. "'" or p66_0
+    return r66_0 .. ".new(" .. tostring(r66_56) .. ")"
+end
+
+r0_12.get_real_value = r0_27
+
+local function r0_28(p16_0, p16_1, p16_2) -- proto#16 params=3 locals=15 upvalues=1 vararg=false source=@moonsec
+    local r16_0 = r0_12.get_real_value(p16_0)
+    if #p16_1 == 0 then
+        return r16_0 .. ":" .. p16_2 .. "()"
+    end
+    if #p16_1 == 1 then
+        return r16_0 .. ":" .. p16_2 .. "(" .. r0_12.get_real_value(p16_1[1]) .. ")"
+    end
+    local r16_1 = r16_0
+    local r16_2 = ":"
+    local r16_3 = p16_2
+    local r16_4 = r16_1 .. r16_2 .. r16_3 .. "(table.unpack("
+    r16_3 = r0_12
+    r16_1 = r16_4 .. r16_3.get_real_value(p16_1)
+    r16_4 = r16_1
+    r16_1 = r16_4 .. "))"
+    return r16_1
+end
+
+r0_12.convert_to_code = r0_28
+
+local function r0_29(p68_0, p68_1, p68_2) -- proto#68 params=3 locals=13 upvalues=1 vararg=false source=@moonsec
+    local r68_0
+    local r68_1 = r0_12.get_real_value(p68_0)
+    local r68_2
+    if #p68_1 > 0 then
+        if #p68_1 == 1 then
+            r68_2 = r0_12.get_real_value(p68_1[1])
+        else
+            r68_2 = "table.unpack(" .. r0_12.get_real_value(p68_1) .. ")"
+        end
+    else
+        r68_2 = ""
+    end
+    repeat
+        if #p68_1 > 0 then
+            local r68_3 = ", " .. r68_2
+            if r68_3 then
+                r68_0 = r68_3
+                break
+            end
+        end
+        r68_0 = ""
+    until true
+    if string.lower(p68_2) == "fireclient" then
+        local r68_4 = r68_1
+        local r68_5 = r68_0
+        return "local Remote = " .. r68_4 .. "\nfiresignal(Remote.OnClientEvent" .. r68_5 .. ")"
+    end
+    if string.lower(p68_2) == "invokeclient" then
+        local r68_6 = r68_1
+        local r68_7 = r68_2
+        return "local Remote = " .. r68_6
+            .. '\nlocal callback = getcallbackmember(Remote, "OnClientInvoke")\ncallback(' .. r68_7
+            .. ")"
+    end
+    local r68_8 = p68_2
+    return "-- Unknown ncm for client: " .. r68_8
+end
+
+r0_12.convert_to_code_client = r0_29
+
+local function r0_30(p7_0, p7_1) -- proto#7 params=2 locals=0 upvalues=1 vararg=false source=@moonsec
+    spawn(function() -- proto#8 params=0 locals=8 upvalues=3 vararg=false source=@moonsec
+        local r8_0, r8_1
+        local r8_2 = Vector3.new(0, 0, 0)
+        local r8_3 = nil
+
+        local function r8_4(p13_0) -- proto#13 params=1 locals=11 upvalues=4 vararg=false source=@moonsec
+            local r13_0 = p13_0.Position - r8_2
+            local r13_1 = UDim2.new(r8_3.X.Scale, r8_3.X.Offset + r13_0.X, r8_3.Y.Scale, r8_3.Y.Offset
+                + r13_0.Y)
+            local r13_2 = r0_6.TweenService
+            local r13_3 = r13_2
+            r13_2 = r13_3.Create
+            local r13_4 = p7_0
+            local r13_5 = TweenInfo.new(0.2)
+            local r13_6 = {}
+            r13_6.Position = r13_1
+            r13_2 = r13_2(r13_3, r13_4, r13_5, r13_6)
+            r13_2:Play()
+        end
+
+        p7_1.InputBegan:Connect(function(p11_0) -- proto#11 params=1 locals=1 upvalues=4 vararg=false source=@moonsec
+            if p11_0.UserInputType == Enum.UserInputType.MouseButton1
+                or p11_0.UserInputType == Enum.UserInputType.Touch and r8_0 == false then
+                r8_2 = p11_0.Position
+                if (p11_0.Position - r8_2).Y <= 30 then
+                    r8_3 = p7_0.Position
+                    local r11_0 = p11_0.Changed
+                    r11_0:Connect(function() -- proto#12 params=0 locals=0 upvalues=2 vararg=false source=@moonsec
+                        if p11_0.UserInputState == Enum.UserInputState.End then
+                            r8_0 = false
+                        end
+                    end)
+                end
+            end
+        end)
+        p7_1.InputChanged:Connect(function(p9_0) -- proto#9 params=1 locals=0 upvalues=1 vararg=false source=@moonsec
+            if p9_0.UserInputType == Enum.UserInputType.MouseMovement
+                or p9_0.UserInputType == Enum.UserInputType.Touch then
+                r8_1 = p9_0
+            end
+        end)
+        r0_6.UserInputService.InputChanged:Connect(function(p10_0) -- proto#10 params=1 locals=0 upvalues=3 vararg=false source=@moonsec
+            if p10_0 == r8_1 and r8_0 then
+                r8_4(p10_0)
+            end
+        end)
+    end)
+end
+
+local function r0_31() -- proto#17 params=0 locals=12 upvalues=5 vararg=false source=@moonsec
+    local r17_0 = {}
+    local r17_1 = {}
+    r17_0.objects = r17_1
+    local r17_2 = r0_12
+    local r17_3 = r0_12
+    local r17_4 = r17_3.createInstance
+    local r17_5 = {}
+    local r17_6 = "UtopiaSpy "
+    local r17_7 = tostring(r0_12.VERSION)
+    r17_6 = r17_6 .. r17_7
+    r17_5.Name = r17_6
+    r17_7 = nil
+    r17_6 = nil
+    r17_4 = r17_4(r17_3, "ScreenGui", r17_5)
+    r17_2.MainGui = r17_4
+    r17_2 = r0_12
+
+    function r17_4() -- proto#19 params=0 locals=5 upvalues=2 vararg=false source=@moonsec
+        local r19_0 = r17_0.Main.Visible
+        local r19_1 = next
+        local r19_2 = r0_12.MainGui
+        local r19_3, r19_4 = r19_2:GetChildren()
+        for r19_5, r19_6 in r19_1, r19_3, r19_4 do
+            if r19_6 == r17_0.Icon then
+                r19_6.Visible = r19_0
+            elseif r19_6 == r17_0.Main then
+                r19_6.Visible = not r19_0
+            else
+                r19_6.Visible = false
+            end
+        end
+    end
+
+    r17_2.Minimize = r17_4
+    r17_2 = r0_12.guiConnections
+    r17_4 = r0_12
+    r17_4 = r17_4.guiConnections
+    r17_4 = #r17_4
+    r17_4 = r17_4 + 1
+    r17_3 = r0_6.UserInputService.InputBegan
+    r17_3 = r17_3:Connect(function(p18_0) -- proto#18 params=1 locals=0 upvalues=1 vararg=false source=@moonsec
+        if p18_0.KeyCode == r0_12.minimizeBind then
+            r0_12.Minimize()
+        end
+    end)
+    r17_2[r17_4] = r17_3
+    if syn then
+        syn.protect_gui(r0_12.MainGui)
+    end
+    r17_2 = r0_12.MainGui
+    r17_4 = gethui
+    r17_4 = r17_4 and gethui() or r0_6.CoreGui
+    r17_2.Parent = r17_4
+    r17_4 = r0_12
+    r17_2 = r17_4.createInstance
+    r17_3 = "Frame"
+    local r17_8 = {}
+    r17_8.Name = "Main"
+    r17_8.Parent = r0_12.MainGui
+    r17_5 = Color3.fromRGB(38, 38, 38)
+    r17_8.BackgroundColor3 = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.326838464, 0, 0.313684225, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 637, 0, 394)
+    r17_8.Size = r17_5
+    r17_8.Draggable = true
+    r17_8.Active = true
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, r17_3, r17_8)
+    r17_0.Main = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "CopiedMessage"
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = Vector2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(1, 1)
+    r17_8.AnchorPoint = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(1, -10, 1, -10)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 180, 0, 30)
+    r17_8.Size = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(66, 165, 76)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = Enum
+    r17_5 = r17_5.Font.GothamBold
+    r17_8.Font = r17_5
+    r17_8.Text = "Discord Link Copied!"
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.TextColor3 = r17_5
+    r17_8.TextSize = 14
+    r17_8.TextTransparency = 1
+    r17_8.Visible = false
+    r17_8.ZIndex = 100
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextLabel", r17_8)
+    r17_0.CopiedMessage = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_3 = "UICorner"
+    r17_8 = {}
+    r17_5 = r17_0.CopiedMessage
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 6)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2(r17_4, r17_3, r17_8)
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Topbar"
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.230337083, 0, 0, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 411, 0, 46)
+    r17_8.Size = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "Frame", r17_8)
+    r17_0.Topbar = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Sidebar"
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(24, 24, 24)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BorderSizePixel = 0
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 124, 1, 0)
+    r17_8.Size = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "Frame", r17_8)
+    r17_0.Sidebar = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Title"
+    r17_5 = r17_0.Sidebar
+    r17_8.Parent = r17_5
+    r17_5 = Vector2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0)
+    r17_8.AnchorPoint = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.492128909, 0, 0.00581395347, 5)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 84, 0, 30)
+    r17_8.Size = r17_5
+    r17_5 = Enum
+    r17_5 = r17_5.Font.GothamBold
+    r17_8.Font = r17_5
+    r17_8.Text = "UtopiaSpy"
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.TextColor3 = r17_5
+    r17_8.TextSize = 24
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextLabel", r17_8)
+    r17_0.Title = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "ButtonContainer"
+    r17_5 = r17_0.Sidebar
+    r17_8.Parent = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 0, 0, 45)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 124, 1, 0)
+    r17_8.Size = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "Frame", r17_8)
+    r17_0.ButtonContainer = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "UIListLayout"
+    r17_5 = r17_0.ButtonContainer
+    r17_8.Parent = r17_5
+    r17_5 = Enum
+    r17_5 = r17_5.SortOrder.LayoutOrder
+    r17_8.SortOrder = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "UIListLayout", r17_8)
+    r17_0.UIListLayout = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "DiscordButton"
+    r17_5 = r17_0.Sidebar
+    r17_8.Parent = r17_5
+    r17_5 = Vector2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0)
+    r17_8.AnchorPoint = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(88, 101, 242)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BorderSizePixel = 0
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0, 0.99, -50)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 100, 0, 25)
+    r17_8.Size = r17_5
+    r17_5 = Enum
+    r17_5 = r17_5.Font.GothamBold
+    r17_8.Font = r17_5
+    r17_8.Text = "Join Discord"
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.TextColor3 = r17_5
+    r17_8.TextSize = 14
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextButton", r17_8)
+    r17_0.DiscordButton = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_3 = "UICorner"
+    r17_8 = {}
+    r17_5 = r17_0.DiscordButton
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 6)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2(r17_4, r17_3, r17_8)
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Version"
+    r17_5 = r17_0.Sidebar
+    r17_8.Parent = r17_5
+    r17_5 = Vector2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0)
+    r17_8.AnchorPoint = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(255, 255, 255)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0, 0.99000001, -20)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 31, 0, 18)
+    r17_8.Size = r17_5
+    r17_5 = Enum
+    r17_5 = r17_5.Font.Gotham
+    r17_8.Font = r17_5
+    r17_5 = tostring
+    r17_5 = r17_5(r0_12.VERSION)
+    r17_8.Text = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(190, 190, 190)
+    r17_8.TextColor3 = r17_5
+    r17_8.TextSize = 15
+    r17_8.TextWrapped = false
+    r17_5 = Enum
+    r17_5 = r17_5.TextXAlignment.Center
+    r17_8.TextXAlignment = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextLabel", r17_8)
+    r17_0.Version = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 6)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "UICorner", r17_8)
+    r17_0.UICorner = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Close"
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(222, 48, 48)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BorderSizePixel = 0
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.974882185, -18, 0, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 26, 0, 7)
+    r17_8.Size = r17_5
+    r17_8.Text = ""
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextButton", r17_8)
+    r17_0.Close = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_5 = r17_0.Close
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 6)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "UICorner", r17_8)
+    r17_0.UICorner2 = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "Minimize"
+    r17_5 = r17_0.Main
+    r17_8.Parent = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(253, 229, 119)
+    r17_8.BackgroundColor3 = r17_5
+    r17_8.BorderSizePixel = 0
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.919937134, -18, 0, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 26, 0, 7)
+    r17_8.Size = r17_5
+    r17_8.Text = ""
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "TextButton", r17_8)
+    r17_0.Minimize = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_5 = r17_0.Minimize
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 6)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "UICorner", r17_8)
+    r17_0.UICorner3 = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_5 = r0_12
+    r17_5 = r17_5.MainGui
+    r17_8.Parent = r17_5
+    r17_5 = Color3
+    r17_5 = r17_5.fromRGB
+    r17_5 = r17_5(24, 24, 24)
+    r17_8.BackgroundColor3 = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.957393527, 0, 0.603157878, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 44, 0, 44)
+    r17_8.Size = r17_5
+    r17_8.Visible = false
+    r17_8.AutoButtonColor = false
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "ImageButton", r17_8)
+    r17_0.Icon = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_8.Name = "ULogo"
+    r17_5 = r17_0.Icon
+    r17_8.Parent = r17_5
+    r17_5 = Vector2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0.5)
+    r17_8.AnchorPoint = r17_5
+    r17_8.BackgroundTransparency = 1
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.5, 0, 0.5, 0)
+    r17_8.Position = r17_5
+    r17_5 = UDim2
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0.699999988, 0, 0.699999988, 0)
+    r17_8.Size = r17_5
+    r17_8.Image = "rbxassetid://86404778975804"
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "ImageLabel", r17_8)
+    r17_0.IconImage = r17_2
+    r17_2 = r0_12
+    r17_4 = r17_2
+    r17_2 = r17_4.createInstance
+    r17_8 = {}
+    r17_5 = r17_0.Icon
+    r17_8.Parent = r17_5
+    r17_5 = UDim
+    r17_5 = r17_5.new
+    r17_5 = r17_5(0, 2147483647)
+    r17_8.CornerRadius = r17_5
+    r17_5 = nil
+    r17_2 = r17_2(r17_4, "UICorner", r17_8)
+    r17_0.UICorner4 = r17_2
+    r17_2 = r17_0.Icon.MouseButton1Click
+    r17_4 = r17_2
+    r17_2 = r17_4.Connect
+    r17_2(r17_4, r0_12.Minimize)
+
+    function r17_2(p20_0) -- proto#20 params=1 locals=9 upvalues=7 vararg=false source=@moonsec
+        local r20_0 = {}
+        r20_0.Name = p20_0
+        r20_0.FullName = p20_0 .. "CallContainer"
+        r20_0.Type = "CallContainer"
+        local r20_1 = {}
+        r20_0.Calls = r20_1
+        r20_1 = r0_12
+        local r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        local r20_3 = {}
+        r20_3.Name = p20_0
+        r20_3.Parent = r17_0.ButtonContainer
+        local r20_4 = UDim2.new(0, 124, 0, 25)
+        r20_3.Size = r20_4
+        r20_3.BackgroundTransparency = 1
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(38, 38, 38)
+        r20_3.BackgroundColor3 = r20_4
+        r20_3.BorderSizePixel = 0
+        r20_4 = Enum
+        r20_4 = r20_4.Font.Gotham
+        r20_3.Font = r20_4
+        r20_3.Text = p20_0
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(255, 255, 255)
+        r20_3.TextColor3 = r20_4
+        r20_3.TextSize = 14
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "TextButton", r20_3)
+        r20_0.Button = r20_1
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_3.Name = "CallContainerBack"
+        r20_4 = r17_0
+        r20_4 = r20_4.Main
+        r20_3.Parent = r20_4
+        r20_3.ClipsDescendants = true
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(23, 23, 23)
+        r20_3.BackgroundColor3 = r20_4
+        r20_3.BorderSizePixel = 0
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(-0.0152793899, 140, 0.0169999953, 0)
+        r20_3.Position = r20_4
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.784279406, 0, 0.967999995, 0)
+        r20_3.Size = r20_4
+        r20_3.Visible = false
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "Frame", r20_3)
+        r20_0.Background = r20_1
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_3.Name = "SearchBox"
+        r20_4 = r20_0.Background
+        r20_3.Parent = r20_4
+        r20_4 = Vector2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.5, 0)
+        r20_3.AnchorPoint = r20_4
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.5, 0, 0, 5)
+        r20_3.Position = r20_4
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.98, 0, 0, 30)
+        r20_3.Size = r20_4
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(38, 38, 38)
+        r20_3.BackgroundColor3 = r20_4
+        r20_4 = Enum
+        r20_4 = r20_4.Font.Gotham
+        r20_3.Font = r20_4
+        r20_3.PlaceholderText = "Search by name..."
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(150, 150, 150)
+        r20_3.PlaceholderColor3 = r20_4
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(255, 255, 255)
+        r20_3.TextColor3 = r20_4
+        r20_3.TextSize = 14
+        r20_3.ClearTextOnFocus = false
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "TextBox", r20_3)
+        r20_0.SearchBox = r20_1
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_4 = r20_0.SearchBox
+        r20_3.Parent = r20_4
+        r20_4 = UDim
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0, 6)
+        r20_3.CornerRadius = r20_4
+        r20_4 = nil
+        r20_1(r20_2, "UICorner", r20_3)
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        local r20_5 = "UIPadding"
+        r20_3 = {}
+        r20_4 = r20_0.SearchBox
+        r20_3.Parent = r20_4
+        r20_4 = UDim
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0, 10)
+        r20_3.PaddingLeft = r20_4
+        r20_4 = nil
+        r20_1(r20_2, r20_5, r20_3)
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_4 = r20_0.FullName
+        r20_3.Name = r20_4
+        r20_4 = r20_0.Background
+        r20_3.Parent = r20_4
+        r20_3.ClipsDescendants = true
+        r20_3.Active = true
+        r20_4 = Vector2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.5, 0)
+        r20_3.AnchorPoint = r20_4
+        r20_4 = Color3
+        r20_4 = r20_4.fromRGB
+        r20_4 = r20_4(24, 24, 24)
+        r20_3.BackgroundColor3 = r20_4
+        r20_3.BackgroundTransparency = 1
+        r20_3.BorderSizePixel = 0
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.5, 0, 0, 40)
+        r20_3.Position = r20_4
+        r20_4 = UDim2
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0.98, 0, 1, -45)
+        r20_3.Size = r20_4
+        r20_3.ScrollBarThickness = 0
+        r20_4 = Enum
+        r20_4 = r20_4.VerticalScrollBarPosition.Left
+        r20_3.VerticalScrollBarPosition = r20_4
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "ScrollingFrame", r20_3)
+        r20_0.Container = r20_1
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_4 = r20_0.Container
+        r20_3.Parent = r20_4
+        r20_4 = Enum
+        r20_4 = r20_4.HorizontalAlignment.Center
+        r20_3.HorizontalAlignment = r20_4
+        r20_4 = Enum
+        r20_4 = r20_4.SortOrder.LayoutOrder
+        r20_3.SortOrder = r20_4
+        r20_4 = UDim
+        r20_4 = r20_4.new
+        r20_4 = r20_4(0, 3)
+        r20_3.Padding = r20_4
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "UIListLayout", r20_3)
+        r20_0.UIListLayout = r20_1
+        r20_1 = r0_12
+        r20_2 = r20_1
+        r20_1 = r20_2.createInstance
+        r20_3 = {}
+        r20_4 = r20_0.Background
+        r20_3.Parent = r20_4
+        r20_4 = nil
+        r20_1 = r20_1(r20_2, "UICorner", r20_3)
+        r20_0.UICorner = r20_1
+        r20_1 = r0_12
+        r20_1 = r20_1.guiConnections
+        local r20_6 = r0_12.guiConnections
+        r20_6 = #r20_6 + 1
+        r20_5 = r20_0.UIListLayout
+        r20_3 = r20_5
+        r20_5 = r20_3.GetPropertyChangedSignal
+        r20_4 = "AbsoluteContentSize"
+        r20_5 = r20_5(r20_3, r20_4)
+        r20_5 = r20_5:Connect(function() -- proto#45 params=0 locals=2 upvalues=1 vararg=false source=@moonsec
+            r20_0.Container.CanvasSize = UDim2.new(0, 0, 0, r20_0.UIListLayout.AbsoluteContentSize.Y)
+        end)
+        r20_1[r20_6] = r20_5
+
+        function r20_1() -- proto#44 params=0 locals=8 upvalues=2 vararg=false source=@moonsec
+            for r44_0, r44_1 in next, r17_1 do
+                if r44_1.Type ~= "CallContainer" or r44_1 == r20_0 then
+                    if r44_1 == r20_0 then
+                        r44_1.Background.Visible = true
+                        r44_1.Button.BackgroundTransparency = 0
+                        if r44_1.SearchBox.Text ~= "" then
+                            r44_1.SearchBox.Text = ""
+                        end
+                    end
+                else
+                    r44_1.Background.Visible = false
+                    r44_1.Button.BackgroundTransparency = 1
+                end
+            end
+            for r44_2, r44_3 in next, r17_1 do
+                for r44_4, r44_5 in next, r44_3.Calls do
+                    r44_5.OptionsContainer.Visible = false
+                    for r44_6, r44_7 in next, r44_5.Calls do
+                        if r44_7.OptionsContainer then
+                            r44_7.OptionsContainer.Visible = false
+                        end
+                    end
+                end
+            end
+        end
+
+        r20_0.open = r20_1
+        r20_1 = r20_0.Button.MouseButton1Click
+        r20_6 = r20_1
+        r20_1 = r20_6.Connect
+        r20_5 = r20_0.open
+        r20_1(r20_6, r20_5)
+
+        function r20_1(p21_0) -- proto#21 params=1 locals=5 upvalues=1 vararg=false source=@moonsec
+            local r21_0 = p21_0:lower()
+            for r21_1, r21_2 in pairs(r20_0.Calls) do
+                local r21_3 = r21_1:lower()
+                local r21_4 = r21_3:find(r21_0, 1, true)
+                r21_2.Call.Visible = r21_4
+                if not r21_4 then
+                    r21_2.ChildrenContainer.Visible = false
+                end
+            end
+        end
+
+        r20_0.Filter = r20_1
+        r20_1 = r0_12
+        r20_1 = r20_1.guiConnections
+        local r20_7 = r0_12.guiConnections
+        r20_7 = #r20_7 + 1
+        r20_5 = r20_0.SearchBox
+        r20_5 = r20_5:GetPropertyChangedSignal("Text")
+        r20_5 = r20_5:Connect(function() -- proto#22 params=0 locals=0 upvalues=1 vararg=false source=@moonsec
+            r20_0.Filter(r20_0.SearchBox.Text)
+        end)
+        r20_1[r20_7] = r20_5
+
+        function r20_1(p23_0, p23_1) -- proto#23 params=2 locals=9 upvalues=7 vararg=false source=@moonsec
+            if r20_0.Calls[p23_0.Name] then
+                r20_0.Calls[p23_0.Name].updateCall(p23_1)
+                return r20_0.Calls[p23_0.Name]
+            end
+            local r23_0 = {}
+            r23_0.Remote = p23_0
+            local r23_1 = {}
+            r23_0.Calls = r23_1
+            r23_0.totalCallCount = 0
+
+            function r23_1(p29_0) -- proto#29 params=1 locals=3 upvalues=1 vararg=false source=@moonsec
+                r23_0.totalCallCount = r23_0.totalCallCount + 1
+                r23_0.CallAmount.Text = "x" .. tostring(r23_0.totalCallCount)
+                r23_0.addNewCall(p29_0, r23_0.totalCallCount)
+            end
+
+            r23_0.updateCall = r23_1
+
+            function r23_1(p32_0, p32_1) -- proto#32 params=2 locals=20 upvalues=5 vararg=false source=@moonsec
+                local r32_0 = {}
+                r32_0.Code = p32_0
+                if r0_12.saveCalls or r0_12.saveOnlyLastCall then
+                    if r0_12.saveOnlyLastCall and #r23_0.Calls > 0 then
+                        local r32_1 = r23_0.Calls[1]
+                        r32_1.CodeLabel.Text = p32_0:gsub("\n", " ")
+                        r32_1.Code = p32_0
+                        r32_1.CallNum.Text = "#" .. tostring(p32_1)
+                        return
+                    end
+                    local r32_2 = r0_12
+                    local r32_3 = r32_2.createInstance
+                    local r32_4 = {}
+                    r32_4.Name = "RemoteCall"
+                    r32_4.Parent = r23_0.ChildrenContainer
+                    r32_4.LayoutOrder = -p32_1
+                    r32_4.AutoButtonColor = false
+                    local r32_5 = Vector2
+                    local r32_6 = r32_5.new(0.5, 0)
+                    r32_4.AnchorPoint = r32_6
+                    r32_6 = Color3
+                    r32_6 = r32_6.fromRGB
+                    r32_6 = r32_6(38, 38, 38)
+                    r32_4.BackgroundColor3 = r32_6
+                    r32_6 = UDim2
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(-0.00993345678, 0, -0.0887730792, 0)
+                    r32_4.Position = r32_6
+                    r32_6 = UDim2
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(0.995000005, 0, 0, 36)
+                    r32_4.Size = r32_6
+                    r32_6 = nil
+                    r32_3 = r32_3(r32_2, "TextButton", r32_4)
+                    r32_0.Call = r32_3
+                    local r32_7 = r0_12
+                    r32_3 = r32_7.createInstance
+                    r32_4 = {}
+                    r32_6 = UDim
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(0, 6)
+                    r32_4.CornerRadius = r32_6
+                    r32_6 = r32_0.Call
+                    r32_4.Parent = r32_6
+                    r32_6 = nil
+                    r32_3 = r32_3(r32_7, "UICorner", r32_4)
+                    r32_0.UICorner = r32_3
+                    local r32_8 = r0_12
+                    r32_3 = r32_8.createInstance
+                    r32_4 = {}
+                    r32_4.Name = "CallNum"
+                    r32_6 = r32_0.Call
+                    r32_4.Parent = r32_6
+                    r32_6 = Vector2
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(0, 0.5)
+                    r32_4.AnchorPoint = r32_6
+                    r32_4.BackgroundTransparency = 1
+                    r32_6 = UDim2
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(0, 12, 0.50000006, 0)
+                    r32_4.Position = r32_6
+                    r32_6 = UDim2
+                    r32_6 = r32_6.new
+                    r32_6 = r32_6(0, 37, 0, 24)
+                    r32_4.Size = r32_6
+                    r32_6 = Enum
+                    r32_6 = r32_6.Font.Gotham
+                    r32_4.Font = r32_6
+                    r32_6 = "#"
+                    local r32_9 = tostring(p32_1)
+                    r32_4.Text = r32_6 .. r32_9
+                    local r32_10 = Color3.fromRGB
+                    r32_9 = 255
+                    r32_10 = r32_10(r32_9, 255, 255)
+                    r32_4.TextColor3 = r32_10
+                    r32_4.TextSize = 14
+                    r32_4.TextWrapped = true
+                    r32_10 = Enum
+                    r32_10 = r32_10.TextXAlignment.Left
+                    r32_4.TextXAlignment = r32_10
+                    r32_10 = nil
+                    r32_3 = r32_3(r32_8, "TextLabel", r32_4)
+                    r32_0.CallNum = r32_3
+                    local r32_11 = r0_12
+                    r32_3 = r32_11.createInstance
+                    r32_4 = {}
+                    r32_4.Name = "CodeContainer"
+                    r32_10 = r32_0.Call
+                    r32_4.Parent = r32_10
+                    r32_4.ScrollBarImageTransparency = 0.75
+                    r32_10 = Enum
+                    r32_10 = r32_10.ScrollingDirection.XY
+                    r32_4.ScrollingDirection = r32_10
+                    r32_4.Active = true
+                    r32_10 = Vector2
+                    r32_10 = r32_10.new
+                    r32_10 = r32_10(0, 0.5)
+                    r32_4.AnchorPoint = r32_10
+                    r32_10 = Color3
+                    r32_10 = r32_10.fromRGB
+                    r32_10 = r32_10(23, 23, 23)
+                    r32_4.BackgroundColor3 = r32_10
+                    r32_4.BorderSizePixel = 0
+                    r32_10 = UDim2
+                    r32_10 = r32_10.new
+                    r32_10 = r32_10(0.079, 0, 0.5, 0)
+                    r32_4.Position = r32_10
+                    r32_10 = UDim2
+                    r32_10 = r32_10.new
+                    r32_10 = r32_10(0, 416, 0, 26)
+                    r32_4.Size = r32_10
+                    r32_10 = Enum
+                    r32_10 = r32_10.ScrollBarInset.Always
+                    r32_4.HorizontalScrollBarInset = r32_10
+                    r32_4.ScrollBarThickness = 2.5
+                    r32_10 = Enum
+                    r32_10 = r32_10.ScrollBarInset.Always
+                    r32_4.VerticalScrollBarInset = r32_10
+                    r32_10 = nil
+                    r32_3 = r32_3(r32_11, "ScrollingFrame", r32_4)
+                    r32_0.CodeContainer = r32_3
+                    local r32_12 = r0_12
+                    r32_3 = r32_12.createInstance
+                    r32_4 = {}
+                    r32_4.Name = "CodeLabel"
+                    r32_10 = r32_0.CodeContainer
+                    r32_4.Parent = r32_10
+                    r32_10 = Enum
+                    r32_10 = r32_10.AutomaticSize.XY
+                    r32_4.AutomaticSize = r32_10
+                    r32_4.BackgroundTransparency = 1
+                    r32_10 = UDim2
+                    r32_10 = r32_10.new
+                    r32_10 = r32_10(0, 10, 0, 0)
+                    r32_4.Position = r32_10
+                    r32_10 = UDim2
+                    r32_10 = r32_10.new
+                    r32_10 = r32_10(0, 771, 0, 25)
+                    r32_4.Size = r32_10
+                    r32_10 = Enum
+                    r32_10 = r32_10.Font.Gotham
+                    r32_4.Font = r32_10
+                    r32_9 = p32_0
+                    r32_10 = r32_9.gsub
+                    r32_10 = r32_10(r32_9, "\n", " ")
+                    r32_4.Text = r32_10
+                    r32_10 = Color3
+                    r32_10 = r32_10.fromRGB
+                    r32_10 = r32_10(255, 255, 255)
+                    r32_4.TextColor3 = r32_10
+                    r32_4.TextSize = 12
+                    r32_10 = Enum
+                    r32_10 = r32_10.TextXAlignment.Left
+                    r32_4.TextXAlignment = r32_10
+                    r32_10 = nil
+                    r32_3 = r32_3(r32_12, "TextLabel", r32_4)
+                    r32_0.CodeLabel = r32_3
+                    r32_3 = r32_0.CodeContainer
+                    local r32_13, r32_14 = UDim2.new, 0
+                    r32_4 = r32_0.CodeLabel.AbsoluteSize.X
+                    r32_4 = r32_4 + 18
+                    r32_10 = 0
+                    r32_13 = r32_13(r32_14, r32_4, r32_10, 0)
+                    r32_3.CanvasSize = r32_13
+                    r32_3 = r0_12
+                    r32_3 = r32_3.guiConnections
+                    r32_13 = r0_12
+                    r32_13 = r32_13.guiConnections
+                    r32_13 = #r32_13
+                    r32_13 = r32_13 + 1
+                    r32_14 = r32_0.CodeLabel
+                    r32_14 = r32_14:GetPropertyChangedSignal("AbsoluteSize")
+                    r32_14 = r32_14:Connect(function() -- proto#42 params=0 locals=4 upvalues=1 vararg=false source=@moonsec
+                        r32_0.CodeContainer.CanvasSize = UDim2.new(0, r32_0.CodeLabel.AbsoluteSize.X
+                            + 18, 0, 0)
+                    end)
+                    r32_3[r32_13] = r32_14
+
+                    function r32_3() -- proto#33 params=0 locals=0 upvalues=2 vararg=false source=@moonsec
+                        r0_5(p32_0)
+                    end
+
+                    r32_0.copy = r32_3
+
+                    function r32_3() -- proto#41 params=0 locals=6 upvalues=1 vararg=false source=@moonsec
+                        if loadstring and p32_0 then
+                            local r41_0, r41_1 = loadstring(p32_0)
+                            if r41_0 then
+                                pcall(r41_0)
+                            else
+                                warn("[UtopiaSpy] Replay Error: " .. tostring(r41_1))
+                            end
+                        end
+                    end
+
+                    r32_0.replay = r32_3
+
+                    function r32_3() -- proto#34 params=0 locals=23 upvalues=6 vararg=false source=@moonsec
+                        local r34_0 = r0_12
+                        local r34_1 = r34_0.createInstance
+                        local r34_2 = {}
+                        r34_2.Name = "DetailFrame"
+                        r34_2.Parent = r0_12.MainGui
+                        local r34_3 = Color3.fromRGB(23, 23, 23)
+                        r34_2.BackgroundColor3 = r34_3
+                        r34_3 = UDim2
+                        r34_3 = r34_3.new
+                        r34_3 = r34_3(0.5, -200, 0.5, -150)
+                        r34_2.Position = r34_3
+                        r34_3 = UDim2
+                        r34_3 = r34_3.new
+                        r34_3 = r34_3(0, 400, 0, 300)
+                        r34_2.Size = r34_3
+                        r34_2.ZIndex = 20
+                        r34_3 = nil
+                        r34_1 = r34_1(r34_0, "Frame", r34_2)
+                        local r34_4 = r0_12
+                        r34_0 = r34_4.createInstance
+                        r34_2 = "UICorner"
+                        r34_3 = {}
+                        r34_3.Parent = r34_1
+                        local r34_5 = UDim.new(0, 6)
+                        r34_3.CornerRadius = r34_5
+                        r34_5 = nil
+                        r34_0(r34_4, r34_2, r34_3)
+                        r34_4 = r0_12
+                        r34_0 = r34_4.createInstance
+                        r34_3 = {}
+                        r34_3.Parent = r34_1
+                        local r34_6 = Color3.fromRGB(222, 48, 48)
+                        r34_3.BackgroundColor3 = r34_6
+                        r34_3.Text = "Close"
+                        r34_6 = Color3
+                        r34_6 = r34_6.fromRGB
+                        r34_6 = r34_6(255, 255, 255)
+                        r34_3.TextColor3 = r34_6
+                        r34_6 = UDim2
+                        r34_6 = r34_6.new
+                        r34_6 = r34_6(1, -80, 0, 5)
+                        r34_3.Position = r34_6
+                        r34_6 = UDim2
+                        r34_6 = r34_6.new
+                        r34_6 = r34_6(0, 70, 0, 20)
+                        r34_3.Size = r34_6
+                        r34_3.ZIndex = 21
+                        r34_6 = nil
+                        r34_0 = r34_0(r34_4, "TextButton", r34_3)
+                        r34_2 = r0_12
+                        r34_4 = r34_2.createInstance
+                        r34_3 = "UICorner"
+                        r34_6 = {}
+                        r34_6.Parent = r34_0
+                        local r34_7 = UDim.new(0, 4)
+                        r34_6.CornerRadius = r34_7
+                        r34_7 = nil
+                        r34_4(r34_2, r34_3, r34_6)
+                        r34_4 = r34_0.MouseButton1Click
+                        r34_4:Connect(function() -- proto#37 params=0 locals=0 upvalues=1 vararg=false source=@moonsec
+                            r34_1:Destroy()
+                        end)
+                        r34_2 = r0_12
+                        r34_4 = r34_2.createInstance
+                        r34_6 = {}
+                        r34_6.Parent = r34_1
+                        local r34_8 = Color3.fromRGB(38, 38, 38)
+                        r34_6.BackgroundColor3 = r34_8
+                        r34_8 = UDim2
+                        r34_8 = r34_8.new
+                        r34_8 = r34_8(0, 10, 0, 35)
+                        r34_6.Position = r34_8
+                        r34_8 = UDim2
+                        r34_8 = r34_8.new
+                        r34_8 = r34_8(1, -20, 1, -85)
+                        r34_6.Size = r34_8
+                        r34_6.ScrollBarThickness = 6
+                        r34_6.ZIndex = 21
+                        r34_8 = nil
+                        r34_4 = r34_4(r34_2, "ScrollingFrame", r34_6)
+                        r34_3 = r0_12
+                        r34_2 = r34_3.createInstance
+                        r34_6 = "UICorner"
+                        r34_8 = {}
+                        r34_8.Parent = r34_4
+                        local r34_9 = UDim.new(0, 4)
+                        r34_8.CornerRadius = r34_9
+                        r34_9 = nil
+                        r34_2(r34_3, r34_6, r34_8)
+                        r34_3 = r0_12
+                        r34_2 = r34_3.createInstance
+                        r34_8 = {}
+                        r34_8.Parent = r34_4
+                        r34_8.Text = r32_0.Code
+                        r34_8.MultiLine = true
+                        r34_8.ClearTextOnFocus = false
+                        r34_8.TextEditable = true
+                        r34_8.TextWrapped = true
+                        r34_8.BackgroundTransparency = 1
+                        local r34_10 = Color3.fromRGB(255, 255, 255)
+                        r34_8.TextColor3 = r34_10
+                        r34_8.TextSize = 12
+                        r34_10 = Enum
+                        r34_10 = r34_10.Font.Code
+                        r34_8.Font = r34_10
+                        r34_10 = UDim2
+                        r34_10 = r34_10.new
+                        r34_10 = r34_10(0, 0, 0, 0)
+                        r34_8.Position = r34_10
+                        r34_10 = UDim2
+                        r34_10 = r34_10.new
+                        r34_10 = r34_10(1, -6, 0, 0)
+                        r34_8.Size = r34_10
+                        r34_10 = Enum
+                        r34_10 = r34_10.TextXAlignment.Left
+                        r34_8.TextXAlignment = r34_10
+                        r34_10 = Enum
+                        r34_10 = r34_10.TextYAlignment.Top
+                        r34_8.TextYAlignment = r34_10
+                        r34_8.ZIndex = 22
+                        r34_10 = nil
+                        r34_2 = r34_2(r34_3, "TextBox", r34_8)
+
+                        function r34_3() -- proto#39 params=0 locals=5 upvalues=3 vararg=false source=@moonsec
+                            local r39_0 = r34_4.AbsoluteSize.X - 6
+                            local r39_1 = r0_6.TextService:GetTextSize(r34_2.Text, r34_2.TextSize, r34_2.Font, Vector2.new(r39_0, math.huge))
+                            r34_2.Size = UDim2.new(1, -6, 0, r39_1.Y)
+                            r34_4.CanvasSize = UDim2.new(0, 0, 0, r39_1.Y)
+                        end
+
+                        r34_6 = r34_3
+                        r34_6()
+                        r34_6 = r0_12
+                        local r34_11 = r34_6.guiConnections
+                        r34_8 = r0_12.guiConnections
+                        r34_8 = #r34_8 + 1
+                        local r34_12 = r34_2
+                        r34_10 = r34_12.GetPropertyChangedSignal
+                        r34_10 = r34_10(r34_12, "Text")
+                        r34_12 = r34_10
+                        r34_10 = r34_12.Connect
+                        r34_10 = r34_10(r34_12, r34_3)
+                        r34_11[r34_8] = r34_10
+                        r34_11 = r0_12.guiConnections
+                        r34_8 = r0_12
+                        r34_8 = r34_8.guiConnections
+                        r34_8 = #r34_8 + 1
+                        r34_12 = r34_4
+                        r34_10 = r34_12.GetPropertyChangedSignal
+                        r34_10 = r34_10(r34_12, "AbsoluteSize")
+                        r34_12 = r34_10
+                        r34_10 = r34_12.Connect
+                        r34_10 = r34_10(r34_12, r34_3)
+                        r34_11[r34_8] = r34_10
+                        r34_8 = r0_12
+                        r34_11 = r34_8.createInstance
+                        r34_10 = "Frame"
+                        r34_12 = {}
+                        r34_12.Parent = r34_1
+                        local r34_13 = UDim2.new(0, 10, 1, -40)
+                        r34_12.Position = r34_13
+                        r34_13 = UDim2
+                        r34_13 = r34_13.new
+                        r34_13 = r34_13(1, -20, 0, 30)
+                        r34_12.Size = r34_13
+                        r34_12.BackgroundTransparency = 1
+                        r34_12.ZIndex = 21
+                        r34_13 = nil
+                        r34_11 = r34_11(r34_8, r34_10, r34_12)
+                        r34_10 = r0_12
+                        r34_8 = r34_10.createInstance
+                        r34_12 = "TextButton"
+                        r34_13 = {}
+                        r34_13.Parent = r34_11
+                        r34_13.Text = "Copy"
+                        local r34_14 = Color3.fromRGB(38, 38, 38)
+                        r34_13.BackgroundColor3 = r34_14
+                        r34_14 = Color3
+                        r34_14 = r34_14.fromRGB
+                        r34_14 = r34_14(255, 255, 255)
+                        r34_13.TextColor3 = r34_14
+                        r34_14 = UDim2
+                        r34_14 = r34_14.new
+                        r34_14 = r34_14(0.25, -5, 1, 0)
+                        r34_13.Size = r34_14
+                        r34_13.ZIndex = 22
+                        r34_14 = nil
+                        r34_8 = r34_8(r34_10, r34_12, r34_13)
+                        r34_12 = r0_12
+                        r34_10 = r34_12.createInstance
+                        r34_13 = "UICorner"
+                        r34_14 = {}
+                        r34_14.Parent = r34_8
+                        local r34_15 = UDim.new(0, 4)
+                        r34_14.CornerRadius = r34_15
+                        r34_15 = nil
+                        r34_10(r34_12, r34_13, r34_14)
+                        r34_10 = r34_8.MouseButton1Click
+                        r34_10:Connect(function() -- proto#40 params=0 locals=0 upvalues=2 vararg=false source=@moonsec
+                            r0_5(r34_2.Text)
+                        end)
+                        r34_12 = r0_12
+                        r34_10 = r34_12.createInstance
+                        r34_14 = {}
+                        r34_14.Parent = r34_11
+                        r34_14.Text = "Replay"
+                        local r34_16 = Color3.fromRGB(38, 38, 38)
+                        r34_14.BackgroundColor3 = r34_16
+                        r34_16 = Color3
+                        r34_16 = r34_16.fromRGB
+                        r34_16 = r34_16(255, 255, 255)
+                        r34_14.TextColor3 = r34_16
+                        r34_16 = UDim2
+                        r34_16 = r34_16.new
+                        r34_16 = r34_16(0.25, 0, 0, 0)
+                        r34_14.Position = r34_16
+                        r34_16 = UDim2
+                        r34_16 = r34_16.new
+                        r34_16 = r34_16(0.25, -5, 1, 0)
+                        r34_14.Size = r34_16
+                        r34_14.ZIndex = 22
+                        r34_16 = nil
+                        r34_10 = r34_10(r34_12, "TextButton", r34_14)
+                        r34_13 = r0_12
+                        r34_12 = r34_13.createInstance
+                        r34_14 = "UICorner"
+                        r34_16 = {}
+                        r34_16.Parent = r34_10
+                        local r34_17 = UDim.new(0, 4)
+                        r34_16.CornerRadius = r34_17
+                        r34_17 = nil
+                        r34_12(r34_13, r34_14, r34_16)
+                        r34_12 = r34_10.MouseButton1Click
+                        r34_12:Connect(function() -- proto#38 params=0 locals=7 upvalues=1 vararg=false source=@moonsec
+                            local r38_0 = r34_2.Text
+                            local r38_1, r38_2 = loadstring(r38_0)
+                            if r38_1 then
+                                pcall(r38_1)
+                            else
+                                warn("[UtopiaSpy] Replay Error: " .. tostring(r38_2))
+                            end
+                        end)
+                        r34_13 = r0_12
+                        r34_12 = r34_13.createInstance
+                        r34_16 = {}
+                        r34_16.Parent = r34_11
+                        r34_16.Text = "Get Return"
+                        local r34_18 = Color3.fromRGB(38, 38, 38)
+                        r34_16.BackgroundColor3 = r34_18
+                        r34_18 = Color3
+                        r34_18 = r34_18.fromRGB
+                        r34_18 = r34_18(255, 255, 255)
+                        r34_16.TextColor3 = r34_18
+                        r34_18 = UDim2
+                        r34_18 = r34_18.new
+                        r34_18 = r34_18(0.5, 0, 0, 0)
+                        r34_16.Position = r34_18
+                        r34_18 = UDim2
+                        r34_18 = r34_18.new
+                        r34_18 = r34_18(0.25, -5, 1, 0)
+                        r34_16.Size = r34_18
+                        r34_16.ZIndex = 22
+                        r34_18 = nil
+                        r34_12 = r34_12(r34_13, "TextButton", r34_16)
+                        r34_14 = r0_12
+                        r34_13 = r34_14.createInstance
+                        r34_16 = "UICorner"
+                        r34_18 = {}
+                        r34_18.Parent = r34_12
+                        local r34_19 = UDim.new(0, 4)
+                        r34_18.CornerRadius = r34_19
+                        r34_19 = nil
+                        r34_13(r34_14, r34_16, r34_18)
+                        r34_14 = r0_12
+                        r34_13 = r34_14.createInstance
+                        r34_18 = {}
+                        r34_18.Parent = r34_11
+                        r34_18.Text = "Ignore"
+                        local r34_20 = Color3.fromRGB(38, 38, 38)
+                        r34_18.BackgroundColor3 = r34_20
+                        r34_20 = Color3
+                        r34_20 = r34_20.fromRGB
+                        r34_20 = r34_20(255, 255, 255)
+                        r34_18.TextColor3 = r34_20
+                        r34_20 = UDim2
+                        r34_20 = r34_20.new
+                        r34_20 = r34_20(0.75, 0, 0, 0)
+                        r34_18.Position = r34_20
+                        r34_20 = UDim2
+                        r34_20 = r34_20.new
+                        r34_20 = r34_20(0.25, -5, 1, 0)
+                        r34_18.Size = r34_20
+                        r34_18.ZIndex = 22
+                        r34_20 = nil
+                        r34_13 = r34_13(r34_14, "TextButton", r34_18)
+                        r34_16 = r0_12
+                        r34_14 = r34_16.createInstance
+                        r34_18 = "UICorner"
+                        r34_20 = {}
+                        r34_20.Parent = r34_13
+                        local r34_21 = UDim.new(0, 4)
+                        r34_20.CornerRadius = r34_21
+                        r34_21 = nil
+                        r34_14(r34_16, r34_18, r34_20)
+                        r34_14 = r34_13.MouseButton1Click
+                        r34_14:Connect(function() -- proto#35 params=0 locals=0 upvalues=3 vararg=false source=@moonsec
+                            if table.find(r0_12.ignored, r23_0.Remote) then
+                                table.remove(r0_12.ignored, table.find(r0_12.ignored, r23_0.Remote))
+                            else
+                                table.insert(r0_12.ignored, r23_0.Remote)
+                            end
+                            r34_1:Destroy()
+                        end)
+                        r34_16 = r0_12
+                        r34_14 = r34_16.createInstance
+                        r34_20 = {}
+                        r34_20.Parent = r34_1
+                        local r34_22 = UDim2.new(0, 10, 1, -70)
+                        r34_20.Position = r34_22
+                        r34_22 = UDim2
+                        r34_22 = r34_22.new
+                        r34_22 = r34_22(1, -20, 0, 30)
+                        r34_20.Size = r34_22
+                        r34_20.BackgroundTransparency = 1
+                        r34_22 = Color3
+                        r34_22 = r34_22.fromRGB
+                        r34_22 = r34_22(255, 255, 255)
+                        r34_20.TextColor3 = r34_22
+                        r34_20.Text = ""
+                        r34_20.TextWrapped = true
+                        r34_20.ZIndex = 22
+                        r34_20.TextSize = 12
+                        r34_22 = Enum
+                        r34_22 = r34_22.Font.Code
+                        r34_20.Font = r34_22
+                        r34_22 = nil
+                        r34_14 = r34_14(r34_16, "TextLabel", r34_20)
+                        r34_16 = r34_12.MouseButton1Click
+                        r34_16:Connect(function() -- proto#36 params=0 locals=20 upvalues=3 vararg=false source=@moonsec
+                            local r36_0 = r34_2.Text
+                            local r36_1, r36_2 = loadstring(r36_0)
+                            if r36_1 then
+                                local r36_3 = { pcall(r36_1) }
+                                if r36_3[1] then
+                                    table.remove(r36_3, 1)
+                                    local r36_4 = ""
+                                    local r36_5, r36_6, r36_7 = ipairs(r36_3)
+                                    for r36_8, r36_9 in r36_5, r36_6, r36_7 do
+                                        local r36_10 = r36_4
+                                        r36_4 = r36_10 .. r0_12.get_real_value(r36_9) .. ", "
+                                    end
+                                    local r36_11 = r36_4:sub(1, -3)
+                                    r36_5 = r34_14
+                                    r36_6 = "Return: "
+                                    r36_7 = r36_11
+                                    r36_5.Text = r36_6 .. r36_7
+                                else
+                                    local r36_12 = r36_3[1]
+                                    local r36_13 = r34_14
+                                    local r36_14 = tostring(r36_12)
+                                    r36_13.Text = "Error: " .. r36_14
+                                end
+                            else
+                                r34_14.Text = "Compile Error: " .. tostring(r36_2)
+                            end
+                        end)
+                        r0_30(r34_1, r34_1)
+                    end
+
+                    r32_0.openDetail = r32_3
+                    r32_3 = r32_0.Call.MouseButton1Click
+                    r32_13 = r32_3
+                    r32_3 = r32_13.Connect
+                    r32_14 = r32_0.openDetail
+                    r32_3(r32_13, r32_14)
+                end
+                table.insert(r23_0.Calls, 1, r32_0)
+                if #r23_0.Calls > 10 then
+                    local r32_15 = table.remove(r23_0.Calls)
+                    if r32_15.Call and r32_15.Call.Parent then
+                        r32_15.Call:Destroy()
+                    end
+                end
+            end
+
+            r23_0.addNewCall = r23_1
+            r23_1 = r0_12
+            local r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            local r23_3 = {}
+            r23_3.Name = "RemoteCall"
+            r23_3.Text = ""
+            r23_3.ClipsDescendants = false
+            r23_3.AutoButtonColor = false
+            r23_3.Parent = r20_0.Container
+            local r23_4 = Vector2.new(0.5, 0)
+            r23_3.AnchorPoint = r23_4
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(38, 38, 38)
+            r23_3.BackgroundColor3 = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.000436, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.995000005, 0, 0, 36)
+            r23_3.Size = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.Call = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_4 = r23_0.Call
+            r23_3.Parent = r23_4
+            r23_4 = UDim
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 6)
+            r23_3.CornerRadius = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "UICorner", r23_3)
+            r23_0.UICorner = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Icon"
+            r23_4 = r23_0.Call
+            r23_3.Parent = r23_4
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 0.5)
+            r23_3.AnchorPoint = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 4, 0.5, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 23, 0, 22)
+            r23_3.Size = r23_4
+            r23_4 = r0_12
+            r23_4 = r23_4.assets
+            local r23_5 = p23_0.ClassName
+            r23_4 = r23_4[r23_5]
+            r23_3.Image = r23_4
+            r23_4 = nil
+            r23_5 = nil
+            r23_1 = r23_1(r23_2, "ImageLabel", r23_3)
+            r23_0.Icon = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Name"
+            r23_4 = r23_0.Call
+            r23_3.Parent = r23_4
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 0.5)
+            r23_3.AnchorPoint = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0737449452, 0, 0.500000238, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 328, 0, 24)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_4 = p23_0.Name
+            r23_3.Text = r23_4
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = Enum
+            r23_4 = r23_4.TextXAlignment.Left
+            r23_3.TextXAlignment = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextLabel", r23_3)
+            r23_0.Name = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "SettingsButton"
+            r23_4 = r23_0.Call
+            r23_3.Parent = r23_4
+            r23_3.ClipsDescendants = true
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 0.5)
+            r23_3.AnchorPoint = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.939999998, 0, 0.5, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 26, 0, 26)
+            r23_3.Size = r23_4
+            r23_3.Image = "rbxassetid://2717396089"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(122, 122, 122)
+            r23_3.ImageColor3 = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.ScaleType.Fit
+            r23_3.ScaleType = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "ImageButton", r23_3)
+            r23_0.SettingsButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "CallAmount"
+            r23_4 = r23_0.Call
+            r23_3.Parent = r23_4
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 0.5)
+            r23_3.AnchorPoint = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.768197536, 0, 0.500000238, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 78, 0, 24)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "x0"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = Enum
+            r23_4 = r23_4.TextXAlignment.Right
+            r23_3.TextXAlignment = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextLabel", r23_3)
+            r23_0.CallAmount = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "OptionsContainer"
+            r23_4 = r0_12
+            r23_4 = r23_4.MainGui
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 1
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(38, 38, 38)
+            r23_3.BorderColor3 = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.fromOffset
+            r23_4 = r23_4(7, 15)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 113, 0, 136)
+            r23_3.Size = r23_4
+            r23_3.Visible = false
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "Frame", r23_3)
+            r23_0.OptionsContainer = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "OptionsButtonContainer"
+            r23_4 = r23_0.OptionsContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.5, 0.5)
+            r23_3.AnchorPoint = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.5, 0, 0.5, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.959999979, 0, 0, 0)
+            r23_3.Size = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "Frame", r23_3)
+            r23_0.OptionsButtonContainer = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.SortOrder.LayoutOrder
+            r23_3.SortOrder = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.VerticalAlignment.Center
+            r23_3.VerticalAlignment = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "UIListLayout", r23_3)
+            r23_0.OptionsUIListLayout = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "CopyLast"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Copy last call"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.CopyButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Copy10"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Copy last x10"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.Copy10Button = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Copy10"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Copy all"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.CopyAllButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Replay"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Replay"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.ReplayButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Ignore"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Ignore"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.IgnoreButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "Block"
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_3.ZIndex = 10
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(23, 23, 23)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BorderSizePixel = 0
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.0967741907, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, 0, 25)
+            r23_3.Size = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.Font.Gotham
+            r23_3.Font = r23_4
+            r23_3.Text = "Block"
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(255, 255, 255)
+            r23_3.TextColor3 = r23_4
+            r23_3.TextSize = 14
+            r23_3.TextWrapped = true
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "TextButton", r23_3)
+            r23_0.BlockButton = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_4 = r23_0.OptionsButtonContainer
+            r23_3.Parent = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "UICorner", r23_3)
+            r23_0.UICorner2 = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_3.Name = "CallChildren"
+            r23_4 = r20_0
+            r23_4 = r23_4.Container
+            r23_3.Parent = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.AutomaticSize.Y
+            r23_3.AutomaticSize = r23_4
+            r23_3.Visible = false
+            r23_4 = Vector2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.5, 0)
+            r23_3.AnchorPoint = r23_4
+            r23_4 = Color3
+            r23_4 = r23_4.fromRGB
+            r23_4 = r23_4(38, 38, 38)
+            r23_3.BackgroundColor3 = r23_4
+            r23_3.BackgroundTransparency = 1
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0.00436409656, 0, 0, 0)
+            r23_3.Position = r23_4
+            r23_4 = UDim2
+            r23_4 = r23_4.new
+            r23_4 = r23_4(1, 0, -0.00600000005, 36)
+            r23_3.Size = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "Frame", r23_3)
+            r23_0.ChildrenContainer = r23_1
+            r23_1 = r0_12
+            r23_2 = r23_1
+            r23_1 = r23_2.createInstance
+            r23_3 = {}
+            r23_4 = r23_0.ChildrenContainer
+            r23_3.Parent = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.HorizontalAlignment.Center
+            r23_3.HorizontalAlignment = r23_4
+            r23_4 = Enum
+            r23_4 = r23_4.SortOrder.LayoutOrder
+            r23_3.SortOrder = r23_4
+            r23_4 = UDim
+            r23_4 = r23_4.new
+            r23_4 = r23_4(0, 3)
+            r23_3.Padding = r23_4
+            r23_4 = nil
+            r23_1 = r23_1(r23_2, "UIListLayout", r23_3)
+            r23_0.ChildrenUIListLayout = r23_1
+            r23_1 = r23_0.OptionsButtonContainer
+            local r23_6 = UDim2.new
+            r23_3 = 0
+            r23_4 = 0
+            r23_6 = r23_6(0.959999979, r23_3, r23_4, r23_0.OptionsUIListLayout.AbsoluteContentSize.Y)
+            r23_1.Size = r23_6
+
+            function r23_1() -- proto#30 params=0 locals=8 upvalues=3 vararg=false source=@moonsec
+                for r30_0, r30_1 in next, r17_1 do
+                    for r30_2, r30_3 in next, r30_1.Calls do
+                        if r30_3.OptionsContainer ~= r23_0.OptionsContainer
+                            and r30_3.OptionsContainer then
+                            r30_3.OptionsContainer.Visible = false
+                        end
+                        for r30_4, r30_5 in next, r30_3.Calls do
+                            if r30_5.OptionsContainer ~= r23_0.OptionsContainer
+                                and r30_5.OptionsContainer then
+                                r30_5.OptionsContainer.Visible = false
+                            end
+                        end
+                    end
+                end
+                if not r23_0.OptionsContainer.Visible then
+                    r23_0.OptionsContainer.Position = UDim2.new(0, r0_11.X, 0, r0_11.Y)
+                end
+                r23_0.OptionsContainer.Visible = not r23_0.OptionsContainer.Visible
+            end
+
+            r23_0.openSettings = r23_1
+
+            function r23_1() -- proto#24 params=0 locals=0 upvalues=2 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if r0_5 and r23_0.Calls[1] ~= nil then
+                    r0_5(r23_0.Calls[1].Code)
+                end
+            end
+
+            r23_0.copyLast = r23_1
+
+            function r23_1() -- proto#31 params=0 locals=11 upvalues=2 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if r0_5 then
+                    local r31_0 = ""
+                    local r31_1 = next
+                    local r31_2 = r23_0.Calls
+                    for r31_3, r31_4 in r31_1, r31_2, nil do
+                        local r31_5 = r31_0
+                        local r31_6 = tostring(r31_3)
+                        local r31_7 = r31_4.Code
+                        r31_0 = r31_5 .. "\n--Call #" .. r31_6 .. [[:
+]] .. r31_7 .. "\n"
+                    end
+                    r0_5(r31_0)
+                end
+            end
+
+            r23_0.copyLast10 = r23_1
+
+            function r23_1() -- proto#28 params=0 locals=11 upvalues=2 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if r0_5 then
+                    local r28_0 = ""
+                    local r28_1 = next
+                    local r28_2 = r23_0.Calls
+                    for r28_3, r28_4 in r28_1, r28_2, nil do
+                        local r28_5 = r28_0
+                        local r28_6 = tostring(r28_3)
+                        local r28_7 = r28_4.Code
+                        r28_0 = r28_5 .. "\n--Call #" .. r28_6 .. [[:
+]] .. r28_7 .. "\n"
+                    end
+                    r0_5(r28_0)
+                end
+            end
+
+            r23_0.copyAll = r23_1
+
+            function r23_1() -- proto#26 params=0 locals=7 upvalues=1 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if loadstring and r23_0.Calls[1] ~= nil then
+                    local r26_0 = r23_0.Calls[1].Code
+                    local r26_1, r26_2 = loadstring(r26_0)
+                    if r26_1 then
+                        pcall(r26_1)
+                    else
+                        warn("UtopiaSpy Replay Error: " .. tostring(r26_2))
+                    end
+                end
+            end
+
+            r23_0.replayLast = r23_1
+
+            function r23_1() -- proto#27 params=0 locals=0 upvalues=3 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if table.find(r0_12.blocked, p23_0) then
+                    table.remove(r0_12.blocked, table.find(r0_12.blocked, p23_0))
+                    r23_0.BlockButton.Text = "Block"
+                    return
+                end
+                r23_0.BlockButton.Text = "Unblock"
+                table.insert(r0_12.blocked, p23_0)
+            end
+
+            r23_0.Block = r23_1
+
+            function r23_1() -- proto#43 params=0 locals=0 upvalues=3 vararg=false source=@moonsec
+                r23_0.OptionsContainer.Visible = false
+                if table.find(r0_12.ignored, p23_0) then
+                    table.remove(r0_12.ignored, table.find(r0_12.ignored, p23_0))
+                    r23_0.IgnoreButton.Text = "Ignore"
+                    return
+                end
+                r23_0.IgnoreButton.Text = "Unignore"
+                table.insert(r0_12.ignored, p23_0)
+            end
+
+            r23_0.Ignore = r23_1
+
+            function r23_1() -- proto#25 params=0 locals=2 upvalues=2 vararg=false source=@moonsec
+                if not r0_12.saveCalls and not r0_12.saveOnlyLastCall then
+                    return
+                end
+                if r23_0.ChildrenContainer.Visible then
+                    for r25_0, r25_1 in next, r23_0.Calls do
+                        if r25_1.OptionsContainer and r25_1.OptionsContainer.Visible then
+                            r25_1.OptionsContainer.Visible = false
+                        end
+                    end
+                end
+                r23_0.ChildrenContainer.Visible = not r23_0.ChildrenContainer.Visible
+            end
+
+            r23_0.Expand = r23_1
+            r23_1 = r23_0.Call.MouseButton2Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.openSettings)
+            r23_1 = r23_0.SettingsButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.openSettings)
+            r23_1 = r23_0.CopyButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.copyLast)
+            r23_1 = r23_0.Copy10Button.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.copyLast10)
+            r23_1 = r23_0.CopyAllButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.copyAll)
+            r23_1 = r23_0.ReplayButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.replayLast)
+            r23_1 = r23_0.BlockButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.Block)
+            r23_1 = r23_0.IgnoreButton.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.Ignore)
+            r23_1 = r23_0.Call.MouseButton1Click
+            r23_6 = r23_1
+            r23_1 = r23_6.Connect
+            r23_1(r23_6, r23_0.Expand)
+            r23_1 = r20_0
+            r23_1 = r23_1.Calls
+            r23_1[p23_0.Name] = r23_0
+            r23_1 = r23_0.updateCall
+            r23_1(p23_1)
+            r23_1 = r20_0
+            r23_1 = r23_1.Filter
+            r23_1(r20_0.SearchBox.Text)
+            return r23_0
+        end
+
+        r20_0.createCall = r20_1
+        r20_1 = r17_1
+        r20_7 = p20_0
+        r20_5 = "CallContainer"
+        r20_1[r20_7 .. r20_5] = r20_0
+        return r20_0
+    end
+
+    r17_0.createCallContainer = r17_2
+    local r17_9 = false
+    r17_4 = r17_0.DiscordButton.MouseButton1Click
+    r17_4:Connect(function() -- proto#46 params=0 locals=17 upvalues=4 vararg=false source=@moonsec
+        if r17_9 then
+            return
+        end
+        r0_5("https://discord.gg/ynuC57McxU")
+        r17_9 = true
+        r17_0.CopiedMessage.Visible = true
+        local r46_0 = TweenInfo.new(0.3, Enum.EasingStyle.Linear)
+        local r46_1 = r0_6.TweenService
+        local r46_2 = r46_1
+        r46_1 = r46_2.Create
+        local r46_3 = r17_0.CopiedMessage
+        local r46_4 = r46_0
+        local r46_5 = {}
+        r46_5.TextTransparency = 0
+        r46_1 = r46_1(r46_2, r46_3, r46_4, r46_5)
+        local r46_6 = r0_6.TweenService
+        r46_3 = r46_6
+        r46_6 = r46_3.Create
+        r46_4 = r17_0
+        local r46_7 = r46_4.CopiedMessage
+        r46_5 = r46_0
+        local r46_8 = {}
+        r46_8.BackgroundTransparency = 0.2
+        r46_6 = r46_6(r46_3, r46_7, r46_5, r46_8)
+        r46_1:Play()
+        r46_6:Play()
+        r46_3 = r46_6.Completed
+        r46_7 = r46_3
+        r46_7:Wait()
+        task.wait(2)
+        local r46_9 = TweenInfo.new
+        r46_5 = Enum
+        r46_9 = r46_9(0.5, r46_5.EasingStyle.Linear)
+        local r46_10 = r0_6.TweenService
+        r46_5 = r46_10
+        r46_10 = r46_5.Create
+        r46_8 = r17_0.CopiedMessage
+        local r46_11 = r46_9
+        local r46_12 = {}
+        r46_12.TextTransparency = 1
+        r46_10 = r46_10(r46_5, r46_8, r46_11, r46_12)
+        local r46_13 = r0_6.TweenService
+        r46_8 = r46_13
+        r46_13 = r46_8.Create
+        r46_11 = r17_0
+        local r46_14 = r46_11.CopiedMessage
+        r46_12 = r46_9
+        local r46_15 = {}
+        r46_15.BackgroundTransparency = 1
+        r46_13 = r46_13(r46_8, r46_14, r46_12, r46_15)
+        r46_10:Play()
+        r46_13:Play()
+        r46_8 = r46_13.Completed
+        r46_14 = r46_8
+        r46_14:Wait()
+        r17_0.CopiedMessage.Visible = false
+        r17_9 = false
+    end)
+    local r17_10 = r17_0.Close.MouseButton1Click
+    r17_10:Connect(r0_12.Destroy)
+    local r17_11 = r17_0.Minimize.MouseButton1Click
+    r17_11:Connect(r0_12.Minimize)
+    return r17_0
+end
+
+r0_12.createUILibrary = r0_31
+local r0_32 = r0_12:createUILibrary()
+r0_12.UILibrary = r0_32
+r0_32 = {}
+local r0_33 = r0_12.UILibrary.createCallContainer("Outgoing")
+r0_32.Outgoing = r0_33
+r0_33 = r0_12.UILibrary.createCallContainer
+r0_33 = r0_33("Incoming")
+r0_32.Incoming = r0_33
+if not r0_0 then
+    r0_12.Minimize()
+end
+
+function r0_33(p50_0, p50_1, p50_2) -- proto#50 params=3 locals=1 upvalues=2 vararg=false source=@moonsec
+    local r50_0 = r0_12.convert_to_code(p50_0, p50_1, p50_2)
+    r0_32.Outgoing.createCall(p50_0, r50_0)
+end
+
+r0_12.onEventFired = r0_33
+
+function r0_33(p47_0, p47_1, p47_2) -- proto#47 params=3 locals=1 upvalues=2 vararg=false source=@moonsec
+    local r47_0 = r0_12.convert_to_code_client(p47_0, p47_1, p47_2)
+    r0_32.Incoming.createCall(p47_0, r47_0)
+end
+
+r0_12.onClientEventFired = r0_33
+
+function r0_33() -- proto#52 params=0 locals=19 upvalues=4 vararg=false source=@moonsec
+    r0_19 = true
+    r0_17 = hookmetamethod(game, "__namecall", newcclosure(function(p55_0, ...) -- proto#55 params=1 locals=5 upvalues=3 vararg=true source=@moonsec
+        local r55_0 = { ... }
+        local r55_1 = getnamecallmethod()
+        local r55_2 = getcallingscript()
+        if r0_19 == true
+            and (string.lower(r55_1) == "invokeserver" or string.lower(r55_1) == "fireserver")
+            and (string.find(p55_0.ClassName, "Event") or string.find(p55_0.ClassName, "Function"))
+            and p55_0 ~= r0_12.event
+            and not table.find(r0_12.ignored, p55_0)
+            and not table.find(r0_12.blacklistedNames, p55_0.Name) then
+            if not checkcaller() and table.find(r0_12.blocked, p55_0) then
+                return
+            end
+            r0_12.event.Fire(r0_12.event, p55_0, r55_0, r55_1, false)
+        end
+        local r55_3 = r0_17
+        local r55_4 = p55_0
+        return r55_3(r55_4, ...)
+    end))
+    local r52_0 = nil
+    local r52_1 = hookfunction(Instance.new("RemoteEvent").FireServer, function(p61_0, ...) -- proto#61 params=1 locals=3 upvalues=3 vararg=true source=@moonsec
+        local r61_0 = { ... }
+        if r0_19 and not table.find(r0_12.ignored, p61_0) then
+            if not checkcaller() and table.find(r0_12.blocked, p61_0) then
+                return
+            end
+            r0_12.event.Fire(r0_12.event, p61_0, r61_0, "FireServer", false)
+        end
+        local r61_1 = r52_0
+        local r61_2 = p61_0
+        return r61_1(r61_2, ...)
+    end)
+    r52_0 = r52_1
+    local r52_2 = nil
+    local r52_3 = hookfunction
+    local r52_4 = Instance.new("RemoteFunction")
+    r52_4 = r52_4.InvokeServer
+    r52_3 = r52_3(r52_4, function(p64_0, ...) -- proto#64 params=1 locals=3 upvalues=3 vararg=true source=@moonsec
+        local r64_0 = { ... }
+        if r0_19 and not table.find(r0_12.ignored, p64_0) then
+            if not checkcaller() and table.find(r0_12.blocked, p64_0) then
+                return
+            end
+            r0_12.event.Fire(r0_12.event, p64_0, r64_0, "InvokeServer", false)
+        end
+        local r64_1 = r52_2
+        local r64_2 = p64_0
+        return r64_1(r64_2, ...)
+    end)
+    r52_2 = r52_3
+    r52_3 = next
+    local r52_5 = game
+    local r52_6, r52_7
+    r52_6, r52_7 = r52_5:GetDescendants()
+    for r52_8, r52_9 in r52_3, r52_6, r52_7 do
+        local r52_10 = r52_9.ClassName
+        if r52_10 == "RemoteEvent" then
+            local r52_11 = r0_12.Connections
+            local r52_12 = r0_12.Connections
+            r52_12 = #r52_12 + 1
+            local r52_13 = r52_9.OnClientEvent
+            r52_13 = r52_13:Connect(function(...) -- proto#65 params=0 locals=1 upvalues=2 vararg=true source=@moonsec
+                local r65_0 = r0_12.event
+                r65_0:Fire(r52_9, { ... }, "FireClient", true)
+            end)
+            r52_11[r52_12] = r52_13
+        end
+        if r0_9 and r52_10 == "RemoteFunction" then
+            local r52_14 = getcallbackmember(r52_9, "OnClientInvoke")
+            local r52_15 = nil
+            local r52_16 = hookfunction(r52_14, newcclosure(function(...) -- proto#54 params=0 locals=1 upvalues=4 vararg=true source=@moonsec
+                if r0_19 then
+                    local r54_0 = r0_12.event
+                    r54_0:Fire(r52_9, { ... }, "InvokeClient", true)
+                end
+                return r52_15(...)
+            end))
+            r52_15 = r52_16
+            local r52_17 = r52_9
+            r52_16 = r52_17.GetPropertyChangedSignal
+            r52_16 = r52_16(r52_17, "OnClientInvoke")
+            r52_17 = r52_16
+            r52_16 = r52_17.Connect
+            r52_16(r52_17, function() -- proto#62 params=0 locals=3 upvalues=3 vararg=false source=@moonsec
+                local r62_0 = getcallbackmember(r52_9, "OnClientInvoke")
+                local r62_1 = nil
+                r62_1 = hookfunction(r62_0, newcclosure(function(...) -- proto#63 params=0 locals=1 upvalues=4 vararg=true source=@moonsec
+                    if r0_19 then
+                        local r63_0 = r0_12.event
+                        r63_0:Fire(r52_9, { ... }, "InvokeClient", true)
+                    end
+                    return r62_1(...)
+                end))
+            end)
+        end
+    end
+    r52_3 = r0_12
+    r52_3 = r52_3.Connections
+    r52_6 = r0_12.Connections
+    r52_6 = #r52_6 + 1
+    r52_7 = game.DescendantAdded
+    r52_7 = r52_7:Connect(function(p56_0) -- proto#56 params=1 locals=8 upvalues=3 vararg=false source=@moonsec
+        local r56_0 = p56_0.ClassName
+        if r56_0 == "RemoteEvent" then
+            r0_12.Connections[#r0_12.Connections + 1] = p56_0.OnClientEvent:Connect(function(...) -- proto#57 params=0 locals=1 upvalues=2 vararg=true source=@moonsec
+                local r57_0 = r0_12.event
+                r57_0:Fire(p56_0, { ... }, "FireClient", true)
+            end)
+        end
+        if r0_9 and r56_0 == "RemoteFunction" then
+            local r56_1 = getcallbackmember(p56_0, "OnClientInvoke")
+            local r56_2 = nil
+            r56_2 = hookfunction(r56_1, newcclosure(function(...) -- proto#58 params=0 locals=1 upvalues=4 vararg=true source=@moonsec
+                if r0_19 then
+                    local r58_0 = r0_12.event
+                    r58_0:Fire(p56_0, { ... }, "InvokeClient", true)
+                end
+                return r56_2(...)
+            end))
+            p56_0:GetPropertyChangedSignal("OnClientInvoke"):Connect(function() -- proto#59 params=0 locals=3 upvalues=3 vararg=false source=@moonsec
+                local r59_0 = getcallbackmember(p56_0, "OnClientInvoke")
+                local r59_1 = nil
+                r59_1 = hookfunction(r59_0, newcclosure(function(...) -- proto#60 params=0 locals=1 upvalues=4 vararg=true source=@moonsec
+                    if r0_19 then
+                        local r60_0 = r0_12.event
+                        r60_0:Fire(p56_0, { ... }, "InvokeClient", true)
+                    end
+                    return r59_1(...)
+                end))
+            end)
+        end
+    end)
+    r52_3[r52_6] = r52_7
+    r52_3 = r0_12
+    r52_3 = r52_3.event.Event
+    r52_6 = r52_3
+    r52_3 = r52_6.Connect
+
+    function r52_7(p53_0, p53_1, p53_2, p53_3) -- proto#53 params=4 locals=0 upvalues=1 vararg=false source=@moonsec
+        if p53_3 then
+            r0_12.onClientEventFired(p53_0, p53_1, p53_2)
+            return
+        end
+        r0_12.onEventFired(p53_0, p53_1, p53_2)
+    end
+
+    r52_3(r52_6, r52_7)
+end
+
+r0_12.hook = r0_33
+
+function r0_33() -- proto#3 params=0 locals=2 upvalues=2 vararg=false source=@moonsec
+    r0_19 = false
+    for r3_0, r3_1 in next, r0_12.Connections do
+        r3_1:Disconnect()
+        r0_12.Connections[r3_0] = nil
+    end
+end
+
+r0_12.unhook = r0_33
+r0_12.hook()
+r0_33 = print
+r0_33("Started UtopiaSpy in", tostring(tick() - r0_2) .. "s")
+]==]
+
 	---------------------------------------------------------------------
 	-- Hook Spy (who calls hookfunction / hookmetamethod / ... ?)
 	---------------------------------------------------------------------
@@ -12950,16 +17150,11 @@ local function main()
 	local HYDRO_BASE = "https://raw.githubusercontent.com/Upbolt/Hydroxide/revision/%s.lua"
 	-- [SPIES:ORIGINALS] add more official scripts here: {id = "Name", url = "raw url", note = "...", overrides = {...}}
 	-- Each entry automatically gets a "Load <id>" button in the Originals tab.
-	local function simpleSpyOverrides()
-		-- the original SimpleSpy calls newcclosure(fn, originalFn) (old 2-argument form); many executors only
-		-- accept newcclosure(fn) and throw "invalid argument #2 ... string expected, got function"
-		local nc = G("newcclosure")
-		return {newcclosure = nc and function(f) return nc(f) end or function(f) return f end}
-	end
 	local ORIGINALS = {
-		{id = "SimpleSpy", url = "https://raw.githubusercontent.com/exxtremestuffs/SimpleSpySource/master/SimpleSpy.lua",
-			note = "SimpleSpy by exx (MPL-2.0) - master/SimpleSpy.lua (newcclosure adapted to 1-argument form)",
-			overrides = simpleSpyOverrides},
+		-- UtopiaSpy: the full original script is embedded in this file (UTOPIA_SRC, search [SPIES:UTOPIA-SRC]),
+		-- so it needs no download and runs exactly as supplied.
+		{id = "UtopiaSpy", source = UTOPIA_SRC,
+			note = "UtopiaSpy (Made by UtopiaTM) - embedded copy, runs as-is; its own window opens separately (RightAlt = minimise)"},
 		{id = "Cobalt", url = "https://github.com/notpoiu/cobalt/releases/latest/download/Cobalt.luau",
 			note = "Cobalt by notpoiu - latest release (loader URL taken from the official Cobalt docs). If it says 'HTML page', your executor's HttpGet is not following GitHub's release redirect: download Cobalt.luau yourself, host it somewhere raw, paste that URL into the box and press 'Load URL'."},
 	}
@@ -12994,9 +17189,7 @@ local function main()
 
 	-- overrides = optional table of globals the loaded script sees instead of the real ones
 	-- (everything else falls through to getgenv()); used below to adapt old scripts to new executors
-	local function loadRemote(url, chunk, overrides)
-		local ok, body = httpGet(url)
-		if not ok then return false, "download failed: " .. tostring(body) end
+	local function runChunk(body, chunk, overrides)
 		local ls = G("loadstring") or loadstring
 		if not ls then return false, "executor lacks loadstring" end
 		local fn, err = ls(body, "=" .. chunk)
@@ -13016,6 +17209,12 @@ local function main()
 		local ok2, res = pcall(fn)
 		if not ok2 then return false, "runtime error: " .. tostring(res) end
 		return true, #body
+	end
+
+	local function loadRemote(url, chunk, overrides)
+		local ok, body = httpGet(url)
+		if not ok then return false, "download failed: " .. tostring(body) end
+		return runChunk(body, chunk, overrides)
 	end
 
 	local function buildOriginalsPanel()
@@ -13038,7 +17237,8 @@ local function main()
 				run(o.id, function()
 					local ov = o.overrides
 					if type(ov) == "function" then ov = ov() end
-					local ok, info = loadRemote(o.url, o.id, ov)
+					local ok, info
+					if o.source then ok, info = runChunk(o.source, o.id, ov) else ok, info = loadRemote(o.url, o.id, ov) end
 					if not ok then error(info, 0) end
 					return o.id .. " loaded (" .. info .. " bytes)\n-- " .. o.note
 				end)
@@ -13062,25 +17262,25 @@ local function main()
 				return "loaded " .. info .. " bytes"
 			end)
 		end}
-		buttons[#buttons + 1] = {"Wobbly windows: ON", 140, function(btn)
-			Lib.Wobbly.Enabled = not Lib.Wobbly.Enabled
-			btn.Text = "Wobbly windows: " .. (Lib.Wobbly.Enabled and "ON" or "OFF")
-		end, function(btn) btn.Text = "Wobbly windows: " .. (Lib.Wobbly.Enabled and "ON" or "OFF") end}
+		buttons[#buttons + 1] = {"Skidnet jelly windows: ON", 140, function(btn)
+			Lib.Skin.Enabled = not Lib.Skin.Enabled
+			btn.Text = "Skidnet jelly windows: " .. (Lib.Skin.Enabled and "ON" or "OFF")
+		end, function(btn) btn.Text = "Skidnet jelly windows: " .. (Lib.Skin.Enabled and "ON" or "OFF") end}
 		P = makePanel({
 			name = "Originals",
 			buttons = buttons,
 			boxes = {{"raw script URL (for Load URL)", 260, "url"}},
 			hint = "-- Originals: runs the real, unmodified tools straight from their official repositories\n"
-				.. "-- (always the newest version, nothing copied into this file).\n"
+				.. "-- (downloaded ones are always the newest version; UtopiaSpy is embedded in this file).\n"
 				.. "--\n"
-				.. "--   SimpleSpy   exxtremestuffs/SimpleSpySource (master)\n"
+				.. "--   UtopiaSpy   embedded original script (no download needed)\n"
 				.. "--   Hydroxide   Upbolt/Hydroxide (revision) - its own Remote Spy, Closure Spy,\n"
 				.. "--               Upvalue / Constant / Script / Module scanners\n"
 				.. "--   Cobalt      notpoiu/cobalt - latest release (loader URL from the official docs)\n"
 				.. "--   Load URL    any other raw script you paste into the box\n"
 				.. "--\n"
-				.. "-- Needs an executor with loadstring + HttpGet (or request).\n"
-				.. "-- The tabs in this window (SimpleSpy, Cobalt, Hydroxide, ...) are BAD DEX's own\n"
+				.. "-- Needs an executor with loadstring (+ HttpGet or request for the downloaded ones).\n"
+				.. "-- The tabs in this window (UtopiaSpy, Cobalt, Hydroxide, ...) are BAD DEX's own\n"
 				.. "-- lightweight versions that live inside Dex.",
 		})
 		Spies.OriginalsPanel = P
@@ -13116,7 +17316,7 @@ local function main()
 		body.Parent = content
 
 		-- [SPIES:TABS] add or reorder tabs here: addTab("Name", buildFn) (tab buttons share the width evenly)
-		addTab("SimpleSpy", function() return buildRemotePanel("simple") end)
+		addTab("UtopiaSpy", function() return buildRemotePanel("simple") end)
 		addTab("Cobalt", function() return buildRemotePanel("cobalt") end)
 		addTab("Hydroxide", buildHydroPanel)
 		addTab("Closure Spy", buildClosurePanel)
@@ -16609,49 +20809,49 @@ DefaultSettings = (function()
 			MaxAttributes = 50,
 			ScaleType = 0 -- 0 Full Name Shown, 1 Equal Halves
 		},
-		Theme = {
+		Theme = { -- [SKIN:THEME] Liquid Glass palette (same family as the Skidnet script)
 			_Recurse = true,
-			Main1 = rgb(30,20,22),
-			Main2 = rgb(23,15,17),
-			Outline1 = rgb(14,9,10),
-			Outline2 = rgb(56,34,38),
-			Outline3 = rgb(12,8,9),
-			TextBox = rgb(26,17,19),
-			Menu = rgb(24,15,17),
-			ListSelection = rgb(200,50,60),
-			Button = rgb(46,28,31),
-			ButtonHover = rgb(62,37,41),
-			ButtonPress = rgb(34,21,23),
-			Highlight = rgb(200,50,60),
-			Text = rgb(236,230,231),
-			PlaceholderText = rgb(120,100,102),
-			Important = rgb(255,90,90),
+			Main1 = rgb(16,20,28),
+			Main2 = rgb(11,14,20),
+			Outline1 = rgb(8,10,14),
+			Outline2 = rgb(48,58,74),
+			Outline3 = rgb(6,8,11),
+			TextBox = rgb(14,18,25),
+			Menu = rgb(13,17,24),
+			ListSelection = rgb(61,174,233),
+			Button = rgb(30,38,52),
+			ButtonHover = rgb(42,52,70),
+			ButtonPress = rgb(22,28,39),
+			Highlight = rgb(61,174,233),
+			Text = rgb(255,255,255),
+			PlaceholderText = rgb(120,130,146),
+			Important = rgb(255,95,87),
 			ExplorerIconMap = "",
 			MiscIconMap = "",
 			Syntax = {
-				Text = rgb(214,206,208),
-				Background = rgb(20,13,15),
+				Text = rgb(222,228,236),
+				Background = rgb(12,15,21),
 				Selection = rgb(255,255,255),
-				SelectionBack = rgb(90,40,46),
-				Operator = rgb(210,200,202),
-				Number = rgb(240,170,90),
-				String = rgb(150,215,140),
-				Comment = rgb(120,105,108),
-				Keyword = rgb(240,90,110),
-				Error = rgb(255,80,80),
-				FindBackground = rgb(120,70,0),
-				MatchingWord = rgb(70,50,54),
-				BuiltIn = rgb(120,200,250),
-				CurrentLine = rgb(40,24,27),
-				LocalMethod = rgb(240,220,140),
-				LocalProperty = rgb(230,140,150),
-				Nil = rgb(240,170,90),
-				Bool = rgb(240,170,90),
-				Function = rgb(240,90,110),
-				Local = rgb(240,90,110),
-				Self = rgb(240,170,90),
-				FunctionName = rgb(240,220,140),
-				Bracket = rgb(210,200,202)
+				SelectionBack = rgb(34,78,110),
+				Operator = rgb(205,213,224),
+				Number = rgb(255,196,120),
+				String = rgb(150,215,160),
+				Comment = rgb(110,122,140),
+				Keyword = rgb(90,190,245),
+				Error = rgb(255,95,87),
+				FindBackground = rgb(110,80,0),
+				MatchingWord = rgb(40,52,70),
+				BuiltIn = rgb(120,215,250),
+				CurrentLine = rgb(24,31,43),
+				LocalMethod = rgb(255,226,150),
+				LocalProperty = rgb(160,200,250),
+				Nil = rgb(255,196,120),
+				Bool = rgb(255,196,120),
+				Function = rgb(90,190,245),
+				Local = rgb(90,190,245),
+				Self = rgb(255,196,120),
+				FunctionName = rgb(255,226,150),
+				Bracket = rgb(205,213,224)
 			},
 		},
 		ScriptViewer = {
@@ -29077,6 +33277,15 @@ return __M["main"]
 
 		local openButton = gui.OpenButton
 		openButton.BackgroundTransparency = 0.2
+		pcall(function() -- [SKIN:LAUNCHER] glass pill launcher (RightCtrl hides it together with the windows)
+			openButton.BackgroundColor3 = Color3.fromRGB(10,12,16)
+			openButton.UICorner.CornerRadius = UDim.new(0,16)
+			openButton.MainFrame.UICorner.CornerRadius = UDim.new(0,14)
+			local __st = Instance.new("UIStroke")
+			__st.Color, __st.Thickness, __st.Transparency, __st.ApplyStrokeMode = Color3.new(1,1,1), 1, 0.35, Enum.ApplyStrokeMode.Border
+			__st.Parent = openButton
+			pcall(function() openButton.FontFace = Font.new("rbxasset://fonts/families/Roboto.json", Enum.FontWeight.Medium) end)
+		end)
 		openButton.MainFrame.Size = UDim2.new(0,0,0,0)
 		openButton.MainFrame.Visible = false
 		openButton.MouseButton1Click:Connect(function()
